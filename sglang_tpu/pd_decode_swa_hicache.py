@@ -25,6 +25,7 @@ import contextlib
 import dataclasses
 import functools
 import logging
+import os
 import weakref
 from typing import Any, Callable, Iterator, Optional
 
@@ -214,8 +215,11 @@ def _build_kv_cache(
         hicache_draft_plan=hicache_draft_plan,
     )
     logger.info(
-        "PD decode SWA HiCache: the host pool holds full-attention KV only, "
-        "the SWA window of every request comes from prefill."
+        "PD decode SWA HiCache: the SWA window of every request comes from "
+        "prefill; the host pool holds %s.",
+        "full-attention and SWA KV (SGLANG_TPU_DECODE_SWA_HOST=1)"
+        if decode_swa_host_enabled()
+        else "full-attention KV only",
     )
     # Upstream rejects decode SWA radix + HiCache before it builds the tree.
     # _create_tree_cache turns HiCache back on for this build.
@@ -339,6 +343,40 @@ def _build_full_only_host_stack(
     )
 
 
+def decode_swa_host_enabled() -> bool:
+    """Keep the sliding-window pages of cached prefixes in the decode host pool.
+
+    The decode itself never reads them (its own requests get the window from
+    prefill), but a prefill that pulls a prefix back from this decode needs
+    the last window with it. See ``pd_peer_prefix``.
+    """
+    return os.environ.get("SGLANG_TPU_DECODE_SWA_HOST", "0") == "1"
+
+
+class _FullAndSwaDecodeStrategy(hybrid_pool_assembler.StackStrategy):
+    """Host stack of a decode cache that keeps full and SWA KV in RAM.
+
+    Same stack as upstream's ``_SwaStrategy`` (the prefill's), registered as a
+    full-only decode cache so the decode's own match, prealloc and restore
+    rules stay as they are. Only the peer prefix serve path reads the SWA
+    host pages, through a restore.
+    """
+
+    def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
+        return decode_swa_host_enabled() and _FULL_ONLY_SWA_STRATEGY.matches(
+            kvcache, components
+        )
+
+    def build(self, *, cache: UnifiedRadixCache, **kwargs):
+        result = hybrid_pool_assembler._SwaStrategy().build(cache=cache, **kwargs)
+        _full_only_host_caches.add(cache)
+        _restore_gated_caches.add(cache)
+        _load_device_pages[result.cache_controller] = {}
+        return dataclasses.replace(
+            result, pools_desc="Full + SWA in RAM (SWA window from prefill)"
+        )
+
+
 class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
     """Host stack of a full-only decode cache: full-attention KV only.
 
@@ -394,6 +432,32 @@ _FULL_ONLY_SWA_STRATEGY = _FullOnlySwaStrategy()
 # ---------------------------------------------------------------------------
 # Prefix matching
 # ---------------------------------------------------------------------------
+
+
+def _swa_build_hicache_transfers(
+    upstream: Callable, component: SWAComponent, node: Any, phase: Any, **kwargs
+):
+    """Wraps ``SWAComponent.build_hicache_transfers`` on a decode cache that
+    keeps SWA pages in RAM. Upstream's load-back walk assumes the SWA
+    validator kept every node within the window resident; the decode's
+    validator does not (the window comes from prefill), so a tombstoned
+    window is possible. Skip the SWA restore then: the decode does not read
+    it, and the peer serve path rejects a prefix whose window is missing."""
+    if (
+        uses_full_only_host_cache(component.cache)
+        and str(getattr(phase, "value", phase)) == "load_back"
+    ):
+        ct = component.component_type
+        n_swa, cur = 0, node
+        root = component.tree_core.root_node
+        window = component.sliding_window_size or 0
+        while cur is not root and n_swa < window:
+            cd = cur.component_data[ct]
+            if cd.value is None and cd.host_value is None:
+                return None
+            n_swa += len(cd.value) if cd.value is not None else len(cd.host_value)
+            cur = cur.parent
+    return upstream(component, node, phase, **kwargs)
 
 
 def _create_swa_match_validator(
@@ -658,6 +722,9 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
         # Decode never reads SWA KV from its cache, so missing SWA KV must not
         # end a match of full-attention KV.
         (SWAComponent, "create_match_validator", _create_swa_match_validator),
+        # With SWA pages in RAM, a load-back may meet a tombstoned window on
+        # the decode; skip the SWA part instead of asserting.
+        (SWAComponent, "build_hicache_transfers", _swa_build_hicache_transfers),
         # Stop decode cache hits where the SWA window starts, so prefill always
         # sends the window.
         (DecodePreallocQueue, "_match_prefix_and_lock", _match_prefix_and_lock),
@@ -707,3 +774,5 @@ def install() -> None:
         _wrap(owner, name, impl)
     # Builds a RAM pool for full-attention KV only, with no SWA pool.
     hybrid_pool_assembler.register_stack_strategy(_FULL_ONLY_SWA_STRATEGY)
+    # Registered after, so it is asked first; it defers unless its flag is set.
+    hybrid_pool_assembler.register_stack_strategy(_FullAndSwaDecodeStrategy())
