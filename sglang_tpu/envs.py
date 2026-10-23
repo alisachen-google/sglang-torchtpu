@@ -142,6 +142,23 @@ class TpuEnvs:
     # of the next eviction victims kept copied to host. Unset: four chunked-prefill
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
+    # PD decode radix cache of a hybrid SWA model (see pd_decode_swa_hicache.py):
+    # host RAM for this many sliding windows, the last window of each cached path,
+    # so a prefill can pull a RAM-resident prefix. 0: the host tier holds full KV
+    # only. 64 windows take about 3 GB per rank for Muse Spark with fp8 KV.
+    SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS = EnvInt(0)
+    # PD prefill radix cache of a hybrid SWA model with HiCache: back up only the
+    # last SWA window of each path to host RAM, as the decode does, so the host
+    # SWA pool holds one window per cached path.
+    SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP = EnvBool(False)
+
+    # Raiden P/D prefix reuse. TPU-only while host exports and native transfer
+    # registration remain owned by this backend.
+    SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX = EnvBool(False)
+    SGLANG_DISAGG_PREFIX_PULL_MIN_TOKENS = EnvInt(0)
+    SGLANG_DISAGG_PREFIX_PULL_MAX_POOL_FRACTION = EnvFloat(0.5)
+    SGLANG_DISAGG_PREFIX_PULL_MIN_FREE_FRACTION = EnvFloat(0.25)
+    SGLANG_DISAGG_PREFIX_VICTIM_PUSH = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:
