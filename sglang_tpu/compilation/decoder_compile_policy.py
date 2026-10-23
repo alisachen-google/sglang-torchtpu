@@ -2025,7 +2025,18 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
 
 class Qwen3VLDecoderTpuCompilePolicy(DecoderTpuCompilePolicy):
-    """Qwen3-VL decoder policy that warms multimodal prefill call shapes."""
+    """Qwen3-VL decoder policy that warms multimodal prefill call shapes.
+
+    ``spmd_safe`` declares the traced graphs identical across TP/EP ranks so
+    ``--use-spmd-compile`` can compile each warmup once and broadcast it. It
+    was verified with ``VERIFY_SPMD_SAFE=1`` for the Qwen3-VL-30B-A3B single
+    host and P/D recipes (#1623). Other models that reuse this policy must
+    pass the same verification before their recipes enable the flag: a
+    rank-dependent constant would ship the owner rank's executable to every
+    rank with no error.
+    """
+
+    spmd_safe = True
 
     def _warmup_host_padding(self) -> None:
         # The compiled inner decoder excludes eager prompt embedding and logits.
