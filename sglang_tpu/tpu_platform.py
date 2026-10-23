@@ -1129,24 +1129,17 @@ class TpuSRTPlatform(SRTPlatform):
         return host_memory_budget_scope(host_memory_budget_bytes())
 
     def get_mha_kv_pool_host_cls(self, device_pool) -> type:
-        from sglang.srt.mem_cache.memory_pool_host import (
-            TpuFusedMHATokenToKVPoolHost,
-        )
-
-        # Upstream relocated MHATokenToKVPoolHost from mem_cache.memory_pool_host
-        # into the mem_cache.pool_host package; TpuFusedMHATokenToKVPoolHost is the
-        # fork's own class and still lives in memory_pool_host.
         from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
         from sglang.srt.runtime_context import get_memory
         from sglang_tpu.kv_pool import TpuFusedMHATokenToKVPool
+        from sglang_tpu.kv_pool_host import (
+            TpuFusedMHATokenToKVPoolHost,
+            TpuRaidenHostKVCache,
+        )
 
         # raiden offloads through tpu-sync's DMA-pinned host pool instead of the
         # torch-copy fused host pool; native (torch_tpu) keeps the fused pool.
         if get_memory().hicache_io_backend == "raiden":
-            from sglang_tpu.kv_pool_host import (
-                TpuRaidenHostKVCache,
-            )
-
             return TpuRaidenHostKVCache
 
         if isinstance(device_pool, TpuFusedMHATokenToKVPool):

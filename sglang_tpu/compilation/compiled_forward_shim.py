@@ -46,8 +46,8 @@ from sglang_tpu.cp_forward import (
 from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.memory_pool_host import TpuFusedMHATokenToKVPoolHost
     from sglang_tpu.compilation.decoder_compile_policy import DecoderTpuCompilePolicy
+    from sglang_tpu.kv_pool_host import TpuFusedMHATokenToKVPoolHost
 
 logger = get_logger(__name__)
 
