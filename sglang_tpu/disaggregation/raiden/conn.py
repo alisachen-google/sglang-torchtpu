@@ -71,6 +71,8 @@ from sglang_tpu.disaggregation.raiden.host_pool import (
     slot_host_bytes,
     slots_within_budget,
 )
+from sglang_tpu.disaggregation.raiden.peer_demote import PeerDemoteMixin
+from sglang_tpu.disaggregation.raiden.peer_prefix import PeerPrefixMixin
 from sglang_tpu.disaggregation.raiden.receiver import (
     RaidenKVReceiver,
     RaidenReceiverMixin,
@@ -116,20 +118,23 @@ def _describe_failure(
     """Why raiden failed ``transfer``, in raiden's field names, leaving out the
     fields it did not report."""
     parts = [f"Raiden {side} failed: req_id={transfer.req_id}"]
-    if transfer.code is not None:
+    # Older tpu-sync wheels report settled transfers without a status code.
+    if getattr(transfer, "code", None) is not None:
         parts.append(f"code={transfer.code}")
-    if transfer.phase is not None:
+    if getattr(transfer, "phase", None) is not None:
         parts.append(f"phase={transfer.phase}")
-    if transfer.peer is not None:
+    if getattr(transfer, "peer", None) is not None:
         parts.append(f"peer={transfer.peer}")
-    if transfer.elapsed_ns is not None:
+    if getattr(transfer, "elapsed_ns", None) is not None:
         parts.append(f"elapsed_ms={transfer.elapsed_ns / 1e6:.1f}")
-    if transfer.reason is not None:
+    if getattr(transfer, "reason", None) is not None:
         parts.append(f"reason={transfer.reason}")
     return " ".join(parts)
 
 
 class RaidenKVManager(
+    PeerDemoteMixin,
+    PeerPrefixMixin,
     RaidenSenderMixin,
     RaidenReceiverMixin,
     CommonKVManager,
@@ -173,6 +178,8 @@ class RaidenKVManager(
             ReshardChunkReady.TAG: self._on_reshard_chunk_ready,
             RoomFailed.TAG: self._on_room_failed,
         }
+        self._peer_init()
+        self._demote_init()
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None

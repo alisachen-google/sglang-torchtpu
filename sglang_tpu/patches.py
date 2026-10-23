@@ -900,6 +900,15 @@ def _patch_pd_decode_async_prefill_info() -> None:
     pd_decode_async_prefill_info.install()
 
 
+def _patch_pd_peer_prefix() -> None:
+    """Let a prefill rank pull an evicted prefix back from its decode peer's
+    HiCache over Raiden (SGLANG_TPU_PEER_PREFIX=1). See ``pd_peer_prefix``.
+    """
+    from sglang_tpu import pd_peer_prefix
+
+    pd_peer_prefix.install()
+
+
 def _patch_host_heap_trim() -> None:
     """Return freed host heap pages once the scheduler is warmed up.
 
@@ -976,6 +985,7 @@ def apply_tpu_patches() -> None:
     _patch_raiden_is_load_back_event_done()
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
+    _patch_pd_peer_prefix()
     _patch_hicache_write_back_copy_ahead()
     _patch_pd_decode_async_prefill_info()
     _patch_host_heap_trim()
