@@ -27,10 +27,10 @@ How: ``WriteBackCopyAhead`` keeps the next ``copy_ahead_tokens`` of KV in
 Upstream PR or issue: not filed; the walk reads the Python tree core.
 Remove when: core backs up the eviction frontier asynchronously itself.
 
-Every host copy of a node inside the window is pinned, whoever made it, or host
-pressure would reclaim it as a duplicate and the next step would copy the same
-victim again. Outside the window it is an ordinary duplicate, so the host pins
-at most ``copy_ahead_tokens`` of duplicates. A window of 0 keeps the
+Every Full host copy of a node inside the window is pinned, whoever made it, or
+host pressure would reclaim it as a duplicate and the next step would copy the
+same victim again. Outside the window it is an ordinary duplicate, so the host
+pins at most ``copy_ahead_tokens`` of duplicates. A window of 0 keeps the
 synchronous policy.
 """
 
@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
     EvictResult,
+    IncLockRefResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
@@ -226,7 +227,24 @@ class WriteBackCopyAhead:
             self.num_tokens += written
         # Pinned while in the window: host pressure must not reclaim a copy the
         # next eviction is about to need.
-        self._host_locks[node.id] = cache.inc_host_lock_ref(node.id).to_dec_params()
+        self._host_locks[node.id] = self._pin_full_host(node)
+
+    def _pin_full_host(self, node: UnifiedTreeNode) -> DecLockRefParams:
+        # Full only: an SWA host lock would hold a window of ancestors off the
+        # SWA host LRU and steer SWA host eviction onto host leaves.
+        core = self._cache.tree_core
+        result = IncLockRefResult(
+            node_id=node.id,
+            skipped_lock_components=tuple(
+                c.component_type
+                for c in core.components
+                if c.component_type != BASE_COMPONENT_TYPE
+            ),
+        )
+        full = self._cache.components[BASE_COMPONENT_TYPE]
+        return full.acquire_component_lock(
+            node=node, result=result, lock_host=True
+        ).to_dec_params()
 
     def _reserve_swa_host(self, node: UnifiedTreeNode) -> None:
         cache = self._cache

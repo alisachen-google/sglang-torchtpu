@@ -1,7 +1,8 @@
 """Unit tests for write_back copy-ahead (sglang_tpu/hicache_write_back_copy_ahead.py).
 
-A real FULL-only ``UnifiedRadixCache`` on CPU with a fake raiden controller
-whose D2H futures complete only when the test says so. Covers the contracts
+A real FULL-only ``UnifiedRadixCache`` on CPU (FULL+SWA for the host pin) with
+a fake raiden controller whose D2H futures complete only when the test says
+so. Covers the contracts
 the TPU e2e gate cannot isolate: which victims the window copies and how
 many it keeps in flight, that an eviction never waits for the window's own
 copies, and that a victim past the window still takes the synchronous backup.
@@ -20,6 +21,7 @@ import torch
 
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -48,6 +51,7 @@ from sglang_tpu.tpu_dma_hybrid_cache_controller import (
 )
 
 FULL = ComponentType.FULL
+SWA = ComponentType.SWA
 
 
 class _FakeFuture:
@@ -173,6 +177,45 @@ def _build_cache(
         token_to_kv_pool_allocator=allocator,
         page_size=1,
         tree_components=(FULL,),
+        tree_core_backend="python",
+    )
+    return UnifiedRadixCache(params), allocator
+
+
+def _build_swa_cache(
+    *, kv_size: int = 64, sliding_window_size: int = 16
+) -> tuple[UnifiedRadixCache, SWATokenToKVPoolAllocator]:
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+    req_to_token_pool = ReqToTokenPool(
+        size=8, max_context_len=128, device="cpu", enable_memory_saver=False
+    )
+    kv_pool = SWAKVPool(
+        size=kv_size,
+        size_swa=kv_size,
+        page_size=1,
+        dtype=torch.bfloat16,
+        head_num=2,
+        head_dim=64,
+        swa_attention_layer_ids=[0],
+        full_attention_layer_ids=[1],
+        device="cpu",
+    )
+    allocator = SWATokenToKVPoolAllocator(
+        size=kv_size,
+        size_swa=kv_size,
+        page_size=1,
+        dtype=torch.bfloat16,
+        device="cpu",
+        kvcache=kv_pool,
+        need_sort=False,
+    )
+    params = CacheInitParams(
+        disable=False,
+        req_to_token_pool=req_to_token_pool,
+        token_to_kv_pool_allocator=allocator,
+        page_size=1,
+        sliding_window_size=sliding_window_size,
+        tree_components=(FULL, SWA),
         tree_core_backend="python",
     )
     return UnifiedRadixCache(params), allocator
@@ -448,6 +491,32 @@ class TestWriteBackCopyAhead(CustomTestCase):
         self.assertFalse(cache.tree_core.is_backuped(b))
         self.assertEqual(_node(cache, b).component_data[FULL].lock_ref, 0)
         self.assertIn(_node(cache, b), cache.tree_core.evictable_device_leaves)
+
+    def test_window_pin_takes_no_swa_host_lock_on_the_path(self):
+        """A window pin holds only the victim's Full host copy; its SWA window
+        stays on the SWA host LRU."""
+        cache, allocator = _build_swa_cache(sliding_window_size=16)
+        controller = _attach_write_back(cache, host_capacity=64, copy_ahead_tokens=4)
+        a = _insert(cache, allocator, [1] * 8)
+        b = _insert(cache, allocator, [1] * 8 + [2] * 4)
+        leaf = _node(cache, b)
+        # Already on host, so the window pins it without a copy.
+        leaf.component_data[FULL].host_value = controller.host.alloc(4)
+        cache.tree_core._update_duplicate_tracking(leaf)
+        copy_ahead = cache._write_back_copy_ahead
+
+        copy_ahead.refill()
+
+        self.assertEqual(copy_ahead.pending_node_ids, set())
+        self.assertEqual(leaf.component_data[FULL].host_lock_ref, 1)
+        for node_id in (a, b):
+            self.assertEqual(_node(cache, node_id).component_data[SWA].host_lock_ref, 0)
+
+        # Leaving the window releases the receipt it took.
+        copy_ahead.copy_ahead_tokens = 0
+        copy_ahead.refill()
+        self.assertEqual(leaf.component_data[FULL].host_lock_ref, 0)
+        cache.sanity_check()
 
 
 class TestCopyAheadSelection(CustomTestCase):
