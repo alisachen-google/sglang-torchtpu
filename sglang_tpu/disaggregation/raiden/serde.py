@@ -44,6 +44,19 @@ class MessageTag(bytes, enum.Enum):
     )
 
     ROOM_FAILED = b"RAIDEN_ROOM_FAILED"  # prefill -> decode: room already failed
+    # Reverse prefix pull (prefill reads an evicted prefix back from the decode
+    # engine's HiCache; see peer_prefix.py).
+    PREFIX_REQ = b"RAIDEN_PREFIX_REQ"  # prefill -> decode: match, pin, register
+    PREFIX_BLOCKS = b"RAIDEN_PREFIX_BLOCKS"  # decode -> prefill: hit + block ids
+    PREFIX_RELEASE = b"RAIDEN_PREFIX_RELEASE"  # prefill -> decode: unpin
+    PREFIX_OFFER = (
+        b"RAIDEN_PREFIX_OFFER"  # decode -> prefill: a finished prefix to prefetch
+    )
+    # Pressure-driven demotion of the prefill's cold host tier into the decode
+    # engine's host tier (see peer_demote.py).
+    DEMOTE_OFFER = b"RAIDEN_DEMOTE_OFFER"  # prefill -> decode: cold nodes, src pages
+    DEMOTE_ACK = b"RAIDEN_DEMOTE_ACK"  # decode -> prefill: landing pages, or refuse
+    DEMOTE_DONE = b"RAIDEN_DEMOTE_DONE"  # prefill -> decode: pushed, insert; or abort
 
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
@@ -191,6 +204,133 @@ class ReshardChunkReady(WireMessage):
         require_non_negative(self.room, "room")
         require_non_negative(self.index, "index")
         require_non_negative(self.uuid, "uuid")
+
+
+class PrefixReq(WireMessage):
+    """Ask a decode rank to serve a prefix from its HiCache for a reverse pull."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_REQ
+    room: int
+    prefill_ip: str
+    prefill_port: int
+    token_ids: list[int]
+    # Tokens the prefill already holds locally; the decode only answers with
+    # a hit longer than this.
+    matched_len: int
+    extra_key: str | None = None
+    cache_salt: str | None = None
+    # Monotonic per prefill rank; replies and releases carry it back so a
+    # late message for an earlier ask of the same room is ignored.
+    seq: int = 0
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.matched_len, "matched_len")
+        _require_port(self.prefill_port)
+
+
+class PrefixBlocks(WireMessage):
+    """Answer a PrefixReq: the usable hit and the registered device blocks."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_BLOCKS
+    room: int
+    hit_len: int
+    uuid: int
+    blocks: list[int]
+    endpoint: str
+    swa_blocks: list[int] = msgspec.field(default_factory=list)
+    swa_endpoint: str = ""
+    error: str = ""
+    seq: int = 0
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+        require_non_negative(self.hit_len, "hit_len")
+        require_non_negative(self.uuid, "uuid")
+
+
+class PrefixRelease(WireMessage):
+    """Tell the decode rank the reverse pull of a room is over: unpin."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_RELEASE
+    room: int
+    seq: int = 0
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+
+
+class PrefixOffer(WireMessage):
+    """Tell the prefill a request finished here and its prefix can be pulled
+    back ahead of the session's next turn."""
+
+    TAG: ClassVar[bytes] = MessageTag.PREFIX_OFFER
+    room: int
+    token_ids: list[int]
+    extra_key: str | None = None
+    cache_salt: str | None = None
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.room, "room")
+
+
+class DemoteNode(msgspec.Struct, forbid_unknown_fields=True):
+    """One host-only radix node the prefill offers: its full token path from
+    the root and the source host page ids of its own segment (the last
+    ``len(pages) * page_size`` tokens)."""
+
+    token_ids: list[int]
+    pages: list[int]
+    extra_key: str | None = None
+    cache_salt: str | None = None
+
+
+class DemoteOffer(WireMessage):
+    """Offer a batch of cold host nodes to the decode peer's host tier."""
+
+    TAG: ClassVar[bytes] = MessageTag.DEMOTE_OFFER
+    seq: int
+    prefill_ip: str
+    prefill_port: int
+    nodes: list[DemoteNode]
+    deadline_ms: int
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.seq, "seq")
+        require_non_negative(self.deadline_ms, "deadline_ms")
+        _require_port(self.prefill_port)
+
+
+class DemoteAck(WireMessage):
+    """Answer a DemoteOffer: which nodes the decode takes, the landing pages
+    it allocated for each, and which it already holds. ``error`` refuses the
+    whole offer."""
+
+    TAG: ClassVar[bytes] = MessageTag.DEMOTE_ACK
+    seq: int
+    accepted: list[int]
+    landing: list[list[int]]
+    address: str = ""
+    existing: list[int] = msgspec.field(default_factory=list)
+    error: str = ""
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.seq, "seq")
+        if len(self.accepted) != len(self.landing):
+            raise ValueError("DemoteAck: one landing list per accepted node")
+
+
+class DemoteDone(WireMessage):
+    """Tell the decode the pushes of an offer landed (insert the nodes), or
+    that the offer is abandoned (free the landing pages)."""
+
+    TAG: ClassVar[bytes] = MessageTag.DEMOTE_DONE
+    seq: int
+    ok: bool
+    accepted: list[int] = msgspec.field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        require_non_negative(self.seq, "seq")
 
 
 class RoomFailed(WireMessage):
