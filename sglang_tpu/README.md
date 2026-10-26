@@ -127,3 +127,50 @@ prepares patches. Live check:
 [`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
 (images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
 `BASE_URL` pointing at the router.
+
+## Experimental P/D victim prefix cache
+
+The v3 policy keeps prefill as the primary prefix cache. Before host pressure
+would discard an old cached branch, prefill exports its full KV and its ending
+SWA window to the decode that served that branch. Decode retains pushed victims;
+ordinary generation requests do not create another persistent radix-cache copy.
+A later prefill miss can pull the victim back through the existing Raiden prefix
+exchange. Different branches of a shared system prompt, cache salts, and adapter
+namespaces retain independent ownership.
+
+For an experiment, enable HiCache on both roles with
+`--enable-hierarchical-cache --hicache-io-backend raiden` and enable decode radix
+caching with `--disaggregation-decode-enable-radix-cache`. Set on both roles:
+
+```bash
+SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1
+SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1
+```
+
+For hybrid SWA models, also set
+`SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP=1` on prefill and size the decode
+window tier with `SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS=128` on decode. The latter
+is a count of windows; choose it together with the decode full-KV host budget.
+The default is zero, preserving the existing full-only host tier when this
+experiment is disabled. Both platform modes use the same implementation.
+
+The current path uses the Python unified radix tree, matching P/D attention-TP
+and context-parallel geometry, equal page sizes/layouts, and no pipeline or
+GDN/Mamba state transfer. Multiple decodes need session affinity so the next
+turn reaches its holder. This is an experimental implementation, not a newly
+validated support-matrix entry.
+
+Exports are independent of later requests. At most four victims per engine are
+in flight, and each must fit one native staging slot. Receivers reserve 25% of
+their device pool for serving. Every rank agrees on the selected branch,
+namespace, length, and window geometry before allocation or insertion. Native
+read IDs include a per-prefill incarnation so separate prefills and restarts
+cannot alias transfers. An ACK timeout does not release source pages while
+native reads remain active. Cache reset/memory release must wait for these
+transfers to drain; an early attempt raises and can be retried.
+
+Raiden currently exports device pages, so host-only victims pass through HBM
+before transfer and are inserted into the decode cache before ordinary HiCache
+write-back moves them to RAM. Direct RAM-to-RAM transfer is a follow-up, not a
+property of this implementation. The final v3 code has not been benchmarked on
+TPU; earlier victim-v5 measurements do not establish its performance.
