@@ -129,7 +129,7 @@ prepares patches. Live check:
 `BASE_URL` pointing at the router.
 
 
-## Experimental P/D victim prefix cache: FULL-only DRAM spill
+## Experimental P/D victim prefix cache: FULL + SWA DRAM spill
 
 Prefill remains the primary prefix cache. Before host pressure discards a cold
 cached branch, it registers pinned FULL KV host pages with
@@ -142,9 +142,12 @@ this spill. Enable HiCache with `--enable-hierarchical-cache
 `--disaggregation-decode-enable-radix-cache`, and
 `SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1` on both roles.
 
-This first milestone supports FULL-only models. Hybrid SWA storage follows in
-the next milestone; reverse recall into prefill is introduced separately after
-that. The feature flag defaults to disabled. The implementation requires the
+This milestone supports FULL-only and hybrid SWA victims. For hybrid models,
+set SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS to a positive window count on decode
+and SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP=1 on prefill. Both FULL
+KV and its matching ending SWA window move through independent host pools;
+publication requires both copies to settle successfully on every rank.
+Reverse recall and host-to-HBM prefix-offer restores follow in milestone 3. The feature flag defaults to disabled. The implementation requires the
 Python unified radix tree, matching P/D attention TP/CP geometry, PP=1, and no
 GDN/Mamba state. It is experimental and has no new live TPU validation.
 
