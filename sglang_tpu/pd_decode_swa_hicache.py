@@ -19,9 +19,9 @@ For every raiden PD decode prefix cache, sliding-window or not, a request that
 reuses pages of an unfinished RAM restore waits for it. Restores that load only
 auxiliary state (no KV pages) are not tracked.
 
-``install()`` wraps a few upstream functions and registers a host stack
-strategy. Except for the restore hold, each behaves exactly like upstream unless
-the decode cache is one of these caches.
+``install()`` wraps the P/D restore and backup policies and registers one
+host-stack strategy for Raiden Prefill and Decode. Both roles use the same pool
+and controller construction, with their own capacities and restore behavior.
 """
 
 from __future__ import annotations
@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
@@ -85,7 +86,7 @@ _swa_window_restore = False
 # Raiden PD decode prefix caches whose requests wait for unfinished restores.
 _restore_gated_caches: weakref.WeakSet[UnifiedRadixCache] = weakref.WeakSet()
 # Owned by _build_kv_cache for the duration of one cache build. While set, the
-# tree cache factory enables HiCache and _FullOnlySwaStrategy matches.
+# tree cache factory enables HiCache and _SwaHostStrategy matches.
 _is_building_full_only_host_cache = False
 # The draft HiCache plan of that build, None without speculative decoding.
 _building_draft_plan: Optional[HiCacheDraftPlan] = None
@@ -300,103 +301,12 @@ def _create_tree_cache(upstream: Callable, ctx: TreeCacheBuildContext):
     return cache
 
 
-def _create_cache_controller(
-    *,
-    params: Any,
-    host_pool_group: HostPoolGroup,
-    transfer_layer_id_max: int,
-    load_cache_event: Any,
-    storage_backend: Optional[str],
-    storage_backend_extra_config: Optional[dict],
-    prefetch_threshold: int,
-    model_name: Optional[str],
-    enable_storage_metrics: bool,
-) -> HybridCacheController:
-    memory = get_memory()
-    return HybridCacheController.create_for_backend(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
-        load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=memory.hicache_write_policy,
-        io_backend=memory.hicache_io_backend,
-        storage_backend=storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=model_name,
-        storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_id_max=transfer_layer_id_max,
-        enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=memory.hicache_host_memory_mode,
-    )
-
-
 def _register_decode_host_cache(
     cache: UnifiedRadixCache, cache_controller: HybridCacheController
 ) -> None:
     _full_only_host_caches.add(cache)
     _restore_gated_caches.add(cache)
     _load_device_pages[cache_controller] = {}
-
-
-def _build_full_only_host_stack(
-    *,
-    cache: UnifiedRadixCache,
-    kvcache: Any,
-    params: Any,
-    **controller_kwargs,
-) -> hybrid_pool_assembler.StackBuildResult:
-    """Build the RAM pool and its controller for full-attention KV only.
-
-    Like ``build_hybrid_swa_stack`` without the SWA pool, so the full pool gets the
-    whole host budget.
-    """
-    # Draft KV registers as a sidecar after this build, never packed.
-    assert not params.mtp_draft_device_pools, "packed MTP draft KV is not supported"
-    full_layer_mapping, swa_layer_mapping = hybrid_pool_assembler._swa_layer_mappings(
-        kvcache
-    )
-    # Full-attention layers interleave with SWA layers. Transfers keep the
-    # stage-wide layer span even though only full-attention layers move.
-    transfer_layer_id_max = (
-        max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
-    )
-    memory = get_memory()
-    full_host_pool = hybrid_pool_assembler.build_kv_host_pool(
-        kv_pool=kvcache.full_kv_pool,
-        page_size=params.page_size,
-        use_mla=False,
-        host_size=memory.hicache_size if memory.hicache_size > 0 else None,
-        pool_label="full",
-    )
-    host_pool_group = HostPoolGroup(
-        [
-            hybrid_pool_assembler.build_pool_entry(
-                name=PoolName.KV,
-                host_pool=full_host_pool,
-                device_pool=kvcache.full_kv_pool,
-                layer_mapping=full_layer_mapping,
-                transfer_layer_id_max=transfer_layer_id_max,
-                is_anchor=True,
-            )
-        ]
-    )
-    cache_controller = _create_cache_controller(
-        params=params,
-        host_pool_group=host_pool_group,
-        transfer_layer_id_max=transfer_layer_id_max,
-        **controller_kwargs,
-    )
-    _register_decode_host_cache(cache, cache_controller)
-    return hybrid_pool_assembler.StackBuildResult(
-        host_pool_group=host_pool_group,
-        cache_controller=cache_controller,
-        component_host_pools={ComponentType.FULL: full_host_pool},
-        pools_desc="Full (SWA window from prefill)",
-    )
 
 
 def _swa_host_window_pages(*, sliding_window_size: int, page_size: int) -> int:
@@ -413,81 +323,133 @@ def _host_size_gb(kv_pool: Any, num_tokens: int) -> float:
     return num_tokens * size_bytes / kv_pool.size / 1e9
 
 
-def _build_full_swa_host_stack(
+def _build_host_stack(
     *,
     cache: UnifiedRadixCache,
     kvcache: Any,
-    params: Any,
-    num_windows: int,
-    **controller_kwargs,
+    params: CacheInitParams,
+    swa_host_windows: Optional[int],
+    **controller_kwargs: Any,
 ) -> hybrid_pool_assembler.StackBuildResult:
-    """Build the full pool with the full-only budget plus an SWA pool for
-    ``num_windows`` windows, with the callbacks upstream's SWA strategy uses.
+    """Build either role's host stack with the existing HiCache pool builders.
 
-    ``build_hybrid_swa_stack`` splits one budget by device bytes, so this builds
-    its group directly to size the SWA pool in windows.
+    None keeps Prefill's normal hybrid budget, zero gives Decode a FULL-only
+    host tier, and a positive count adds Decode's independently sized SWA tier.
+    Pool construction is shared; request restore policy belongs to the caller.
     """
-    assert not params.mtp_draft_device_pools, "packed MTP draft KV is not supported"
-    full_layer_mapping, swa_layer_mapping = hybrid_pool_assembler._swa_layer_mappings(
-        kvcache
-    )
-    transfer_layer_id_max = (
-        max(full_layer_mapping.keys() | swa_layer_mapping.keys()) + 1
-    )
-    allocator = params.token_to_kv_pool_allocator
-    window_pages = _swa_host_window_pages(
-        sliding_window_size=params.sliding_window_size, page_size=params.page_size
-    )
-    enable_unified_memory = get_memory().enable_unified_memory
-    host_pool_group = hybrid_pool_assembler.build_hybrid_swa_group(
-        page_size=params.page_size,
-        full_kv_pool=kvcache.full_kv_pool,
-        swa_kv_pool=kvcache.swa_kv_pool,
-        full_layer_mapping=full_layer_mapping,
-        swa_layer_mapping=swa_layer_mapping,
-        use_mla=False,
-        # None: --hicache-size, else --hicache-ratio, as the full-only pool.
-        kv_host_size=None,
-        swa_host_size=_host_size_gb(
-            kvcache.swa_kv_pool, num_windows * window_pages * params.page_size
-        ),
-        host_full_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
-        host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
-        device_swa_evict_fn=lambda n: hybrid_pool_assembler._evict_swa_for_device_alloc(
-            cache, n
-        ),
-        swa_attn_allocator=allocator.swa_attn_allocator,
-        swa_indices_from_anchor_fn=(
-            allocator.bind_swa_for_loaded_rows if enable_unified_memory else None
-        ),
-        swa_free_from_anchor_fn=allocator.free_swa if enable_unified_memory else None,
-    )
-    cache_controller = _create_cache_controller(
-        params=params,
-        host_pool_group=host_pool_group,
+    full_mapping, swa_mapping = hybrid_pool_assembler._swa_layer_mappings(kvcache)
+    transfer_layer_id_max = max(full_mapping.keys() | swa_mapping.keys()) + 1
+    memory = get_memory()
+    pools = {ComponentType.FULL: PoolName.KV}
+    if swa_host_windows == 0:
+        full_host_pool = hybrid_pool_assembler.build_kv_host_pool(
+            kv_pool=kvcache.full_kv_pool,
+            page_size=params.page_size,
+            use_mla=False,
+            host_size=memory.hicache_size if memory.hicache_size > 0 else None,
+            pool_label="full",
+        )
+        host_pool_group = HostPoolGroup(
+            [
+                hybrid_pool_assembler.build_pool_entry(
+                    name=PoolName.KV,
+                    host_pool=full_host_pool,
+                    device_pool=kvcache.full_kv_pool,
+                    layer_mapping=full_mapping,
+                    # Keep gaps for SWA layers even in a FULL-only host tier.
+                    transfer_layer_id_max=transfer_layer_id_max,
+                    is_anchor=True,
+                )
+            ]
+        )
+        pools_desc = "Full (SWA window from prefill)"
+    else:
+        allocator = params.token_to_kv_pool_allocator
+        mtp_swa_device_pools = tuple(
+            pool.swa_kv_pool for pool in params.mtp_draft_device_pools
+        )
+        kv_host_size = swa_host_size = None
+        if swa_host_windows is None:
+            # Preserve the built-in hybrid strategy's fixed/ratio/shared-arena
+            # sizing, including packed draft SWA pools on Prefill.
+            if memory.hicache_size > 0 and not (
+                hybrid_pool_assembler._uses_unified_page_envelope_host(
+                    kvcache.full_kv_pool,
+                    kvcache.swa_kv_pool,
+                    False,
+                    mtp_swa_device_pools,
+                )
+            ):
+                kv_host_size, swa_host_size = hybrid_pool_assembler._split_hicache_size(
+                    memory.hicache_size, (kvcache.full_kv_pool, kvcache.swa_kv_pool)
+                )
+            pools_desc = "Full + SWA"
+        else:
+            window_pages = _swa_host_window_pages(
+                sliding_window_size=params.sliding_window_size,
+                page_size=params.page_size,
+            )
+            swa_host_size = _host_size_gb(
+                kvcache.swa_kv_pool,
+                swa_host_windows * window_pages * params.page_size,
+            )
+            pools_desc = f"Full + SWA ({swa_host_windows} path-end windows)"
+        host_pool_group = hybrid_pool_assembler.build_hybrid_swa_group(
+            page_size=params.page_size,
+            full_kv_pool=kvcache.full_kv_pool,
+            swa_kv_pool=kvcache.swa_kv_pool,
+            full_layer_mapping=full_mapping,
+            swa_layer_mapping=swa_mapping,
+            use_mla=False,
+            kv_host_size=kv_host_size,
+            swa_host_size=swa_host_size,
+            host_full_evict_fn=lambda n: cache.evict_host(n, ComponentType.FULL),
+            host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
+            device_swa_evict_fn=lambda n: (
+                hybrid_pool_assembler._evict_swa_for_device_alloc(cache, n)
+            ),
+            swa_attn_allocator=allocator.swa_attn_allocator,
+            swa_indices_from_anchor_fn=(
+                allocator.bind_swa_for_loaded_rows
+                if memory.enable_unified_memory
+                else None
+            ),
+            swa_free_from_anchor_fn=(
+                allocator.free_swa if memory.enable_unified_memory else None
+            ),
+            mtp_swa_device_pools=mtp_swa_device_pools,
+        )
+        pools[ComponentType.SWA] = PoolName.SWA
+    cache_controller = HybridCacheController.create_for_backend(
+        params.token_to_kv_pool_allocator,
+        host_pool_group,
+        params.page_size,
+        params.tp_cache_group,
+        attn_cp_group=params.attn_cp_cache_group,
+        attn_tp_group=params.attn_tp_cache_group,
+        pp_group=params.pp_cache_group,
+        write_policy=memory.hicache_write_policy,
+        io_backend=memory.hicache_io_backend,
         transfer_layer_id_max=transfer_layer_id_max,
+        host_memory_mode=memory.hicache_host_memory_mode,
         **controller_kwargs,
     )
-    _register_decode_host_cache(cache, cache_controller)
-    _window_host_caches.add(cache)
     return hybrid_pool_assembler.StackBuildResult(
         host_pool_group=host_pool_group,
         cache_controller=cache_controller,
         component_host_pools={
-            ComponentType.FULL: host_pool_group.get_pool(PoolName.KV),
-            ComponentType.SWA: host_pool_group.get_pool(PoolName.SWA),
+            component: host_pool_group.get_pool(name)
+            for component, name in pools.items()
         },
-        pools_desc=f"Full + SWA ({num_windows} path-end windows)",
+        pools_desc=pools_desc,
     )
 
 
-class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
-    """Host stack of a full-only decode cache: full-attention KV, plus SWA
-    windows when SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS > 0.
+class _SwaHostStrategy(hybrid_pool_assembler.StackStrategy):
+    """One Raiden host-stack strategy for P/D hybrid caches.
 
-    ``install()`` registers it ahead of the built-in strategies. It matches only
-    while ``_build_kv_cache`` builds a full-only cache, so every other cache keeps
-    its upstream stack.
+    Prefill keeps the built-in hybrid sizing. A guarded Decode build selects
+    FULL-only storage or an additional budget in ending SWA windows.
     """
 
     def matches(self, kvcache: Any, components: set[ComponentType]) -> bool:
@@ -498,10 +460,16 @@ class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         return (
-            _is_building_full_only_host_cache
-            and isinstance(kvcache, SWAKVPool)
+            isinstance(kvcache, SWAKVPool)
             and not isinstance(kvcache, DeepSeekV4TokenToKVPool)
             and components == {ComponentType.FULL, ComponentType.SWA}
+            and (
+                _is_building_full_only_host_cache
+                or (
+                    get_disagg().disaggregation_mode == "prefill"
+                    and get_memory().hicache_io_backend == "raiden"
+                )
+            )
         )
 
     def build(
@@ -509,7 +477,7 @@ class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
         *,
         cache: UnifiedRadixCache,
         kvcache: Any,
-        params: Any,
+        params: CacheInitParams,
         server_args: Any,
         load_cache_event: Any,
         storage_backend: Optional[str] = None,
@@ -526,21 +494,30 @@ class _FullOnlySwaStrategy(hybrid_pool_assembler.StackStrategy):
             model_name=model_name,
             enable_storage_metrics=enable_storage_metrics,
         )
-        num_windows = tpu_envs.SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS.get()
-        if num_windows <= 0:
-            return _build_full_only_host_stack(
-                cache=cache, kvcache=kvcache, params=params, **controller_kwargs
+        swa_host_windows = None
+        if _is_building_full_only_host_cache:
+            # Decode draft KV is registered later as a sidecar, never packed.
+            assert not params.mtp_draft_device_pools, (
+                "packed MTP draft KV is not supported"
             )
-        return _build_full_swa_host_stack(
+            swa_host_windows = max(
+                0, tpu_envs.SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS.get()
+            )
+        result = _build_host_stack(
             cache=cache,
             kvcache=kvcache,
             params=params,
-            num_windows=num_windows,
+            swa_host_windows=swa_host_windows,
             **controller_kwargs,
         )
+        if _is_building_full_only_host_cache:
+            _register_decode_host_cache(cache, result.cache_controller)
+            if swa_host_windows:
+                _window_host_caches.add(cache)
+        return result
 
 
-_FULL_ONLY_SWA_STRATEGY = _FullOnlySwaStrategy()
+_SWA_HOST_STRATEGY = _SwaHostStrategy()
 
 
 # ---------------------------------------------------------------------------
@@ -1009,5 +986,5 @@ def install() -> None:
     _is_installed = True
     for owner, name, impl in _patch_targets():
         _wrap(owner, name, impl)
-    # Builds a RAM pool for full-attention KV only, with no SWA pool.
-    hybrid_pool_assembler.register_stack_strategy(_FULL_ONLY_SWA_STRATEGY)
+    # Share pool construction while keeping each role's budget and restore policy.
+    hybrid_pool_assembler.register_stack_strategy(_SWA_HOST_STRATEGY)

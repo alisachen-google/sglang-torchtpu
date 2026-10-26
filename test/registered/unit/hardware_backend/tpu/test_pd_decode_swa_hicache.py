@@ -91,7 +91,7 @@ def installed_patches():
     finally:
         for owner, name, original in originals:
             setattr(owner, name, original)
-        hybrid_pool_assembler._STRATEGIES.remove(tpu._FULL_ONLY_SWA_STRATEGY)
+        hybrid_pool_assembler._STRATEGIES.remove(tpu._SWA_HOST_STRATEGY)
         tpu._is_installed = False
 
 
@@ -503,11 +503,14 @@ class TestFullOnlyHostStack(CustomTestCase):
             patch(ASSEMBLER + ".build_pool_entry", autospec=True) as entry,
             patch(TPU + ".HybridCacheController.create_for_backend") as controller,
             patch(TPU + ".HostPoolGroup", autospec=True) as group,
+            tpu._full_only_host_cache_build(None),
+            tpu_envs.SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS.override(0),
         ):
-            result = tpu._build_full_only_host_stack(
+            result = tpu._SWA_HOST_STRATEGY.build(
                 cache=cache,
                 kvcache=kvcache,
                 params=params,
+                server_args=None,
                 load_cache_event=None,
                 storage_backend=None,
                 storage_backend_extra_config=None,
@@ -577,7 +580,7 @@ class TestFullOnlyStrategy(CustomTestCase):
             # Outside a full-only build, upstream picks its own SWA stack.
             self.assertIsNot(
                 hybrid_pool_assembler._select_strategy(kvcache, components),
-                tpu._FULL_ONLY_SWA_STRATEGY,
+                tpu._SWA_HOST_STRATEGY,
             )
             with tpu._full_only_host_cache_build(None):
                 hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache(
@@ -1442,7 +1445,7 @@ class TestInstall(CustomTestCase):
                 with self.subTest(target=f"{owner.__name__}.{name}"):
                     self.assertIs(getattr(owner, name).__wrapped__, original)
             self.assertEqual(
-                hybrid_pool_assembler._STRATEGIES.count(tpu._FULL_ONLY_SWA_STRATEGY), 1
+                hybrid_pool_assembler._STRATEGIES.count(tpu._SWA_HOST_STRATEGY), 1
             )
         for owner, name, original in originals:
             self.assertIs(getattr(owner, name), original)
