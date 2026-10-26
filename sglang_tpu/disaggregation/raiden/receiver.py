@@ -38,8 +38,11 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimPush,
     write_aux_blob,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 if TYPE_CHECKING:
     from sglang_tpu.disaggregation.raiden.conn import RaidenKVManager
@@ -289,6 +292,103 @@ class RaidenReceiverMixin:
             ip=info["rank_ip"], port=info["rank_port"]
         )
         return True
+
+    # ----- victim push (pd_victim_push.py) -----------------------------------
+
+    def _on_victim_push(self, msg: List[bytes]) -> None:
+        push = VictimPush.from_frames(msg)
+        with self._state_lock:
+            self._decode.victim_pushes[(push.prefill, push.seq)] = push
+
+    def victim_pushes(self) -> Dict[Tuple[str, int], VictimPush]:
+        """Pushes received and not yet taken, by (prefill, seq)."""
+        with self._state_lock:
+            return dict(self._decode.victim_pushes)
+
+    def take_victim_push(self, key: Tuple[str, int]) -> Optional[VictimPush]:
+        with self._state_lock:
+            return self._decode.victim_pushes.pop(key, None)
+
+    def start_victim_read(
+        self, *, push: VictimPush, local: List[int], swa_local: List[int]
+    ) -> str:
+        """Read a pushed session's pages into this rank's ``local`` and
+        ``swa_local`` under one staging admission: "started", "retry" (no host
+        staging free yet) or "failed"."""
+        pages, swa_pages = len(local), len(swa_local)
+        if (
+            pages == 0
+            or pages != len(push.blocks)
+            or swa_pages != len(push.swa_blocks)
+            or (swa_pages and self._swa_engine is None)
+            or pages > self._full_engine_max_blocks
+            or swa_pages > self._swa_engine_max_blocks
+        ):
+            return "failed"
+        cost = self._staging_cost(pages, self._full_engine_max_blocks)
+        swa_cost = (
+            self._staging_cost(swa_pages, self._swa_engine_max_blocks)
+            if swa_pages
+            else 0
+        )
+        with self._state_lock:
+            if self._pulling is None:
+                return "failed"
+            if push.req_id in self._pulling:
+                return "started"
+            if not self._pulling.admit(push.req_id, cost, swa_cost):
+                return "retry"
+        # A read that raises is settled as failed, which the caller's poll sees.
+        if (
+            self._start_read_or_fail(
+                room=None,
+                engine=self._ensure_engine(),
+                req_id=push.req_id,
+                uuid=push.uuid,
+                endpoint=push.endpoint,
+                remote=list(push.blocks),
+                local=list(local),
+                unissued=(push.swa_req_id,) if swa_pages else (),
+            )
+            and swa_pages
+        ):
+            self._start_read_or_fail(
+                room=None,
+                engine=self._swa_engine,
+                req_id=push.swa_req_id,
+                uuid=push.swa_uuid,
+                endpoint=push.swa_endpoint,
+                remote=list(push.swa_blocks),
+                local=list(swa_local),
+            )
+        return "started"
+
+    def victim_read_state(self, req_ids: Sequence[str]) -> str:
+        """ "done" once every read landed, "failed" once all settled with a
+        failure, else "pending"."""
+        with self._state_lock:
+            if all(rid in self._completed_recv for rid in req_ids):
+                return "done"
+            if all(
+                rid in self._completed_recv or rid in self._native_failed
+                for rid in req_ids
+            ):
+                return "failed"
+            return "pending"
+
+    def forget_victim_read(self, req_ids: Sequence[str]) -> None:
+        with self._state_lock:
+            for rid in req_ids:
+                if self._pulling is not None:
+                    self._pulling.forget(rid)
+                self._completed_recv.discard(rid)
+                self._native_failed.discard(rid)
+                self._failed.discard(rid)
+
+    def send_victim_ack(self, *, endpoint: str, seq: int, stored: bool) -> None:
+        self._send_prefix_message(
+            -1, endpoint, VictimAck(seq=seq, stored=stored).to_frames()
+        )
 
     def prefix_offer_owed(self, room: int) -> bool:
         with self._state_lock:
@@ -1550,6 +1650,17 @@ class RaidenKVReceiver(CommonKVReceiver):
             )
             # Reverse prefix reads cannot use the forward path's resharding.
             allow_prefix_offer = allow_prefix_offer and matching_geometry
+            if (
+                tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get()
+                and not matching_geometry
+            ):
+                self.kv_mgr.record_failure(
+                    self.bootstrap_room,
+                    "Victim prefix caching requires matching P/D attention TP/CP sizes and PP=1",
+                )
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                self.conclude_state = KVPoll.Failed
+                return
         self.kv_mgr.register_decode_request(
             self.bootstrap_room,
             [int(x) for x in kv_indices],

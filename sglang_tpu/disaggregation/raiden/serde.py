@@ -9,7 +9,7 @@ from __future__ import annotations
 import ctypes
 import enum
 import struct
-from typing import ClassVar, List
+from typing import ClassVar, List, Optional
 
 import msgspec
 
@@ -49,6 +49,11 @@ class MessageTag(bytes, enum.Enum):
     PREFIX_OFFER = b"RAIDEN_PREFIX_OFFER"  # decode -> prefill: resident prefix pages
     PREFIX_PULL = b"RAIDEN_PREFIX_PULL"  # prefill -> decode: register this page range
     PREFIX_READY = b"RAIDEN_PREFIX_READY"  # decode -> prefill: registered, pull now
+
+    # Victim push: the prefill hands a session it is about to evict to the decode
+    # that served it (sglang_tpu/pd_victim_push.py).
+    VICTIM_PUSH = b"RAIDEN_VICTIM_PUSH"  # prefill -> decode: pages to read
+    VICTIM_ACK = b"RAIDEN_VICTIM_ACK"  # decode -> prefill: stored or not
 
     # CommonKVReceiver owns this backend-independent positional message.
     ABORT = b"ABORT"  # decode -> prefill: room, decode ip, decode port
@@ -148,6 +153,41 @@ class PrefixReady(WireMessage):
         require_non_negative(self.swa_uuid, "swa_uuid")
         require_non_negative(self.swa_first_page, "swa_first_page")
         require_non_negative(self.swa_num_pages, "swa_num_pages")
+
+
+class VictimPush(WireMessage):
+    """A session the prefill is about to evict, registered for the decode's read.
+
+    ``tokens`` are the session's first ``len(blocks) * page_size`` token ids;
+    the full pages cover them all, the window pages the tail. Ids, uuids and
+    pages are this rank's; ``prefill`` and ``seq`` are the same on every rank
+    of the prefill engine.
+    """
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_PUSH
+    prefill: str
+    seq: int
+    ack_endpoint: str
+    tokens: list[int]
+    endpoint: str
+    req_id: str
+    uuid: int
+    blocks: list[int]
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
+    is_eagle: bool = False
+    swa_endpoint: str = ""
+    swa_req_id: str = ""
+    swa_uuid: int = 0
+    swa_blocks: list[int] = msgspec.field(default_factory=list)
+
+
+class VictimAck(WireMessage):
+    """Whether the decode read and stored a pushed session."""
+
+    TAG: ClassVar[bytes] = MessageTag.VICTIM_ACK
+    seq: int
+    stored: bool
 
 
 class Blocks(WireMessage):

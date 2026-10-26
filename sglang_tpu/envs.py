@@ -158,6 +158,7 @@ class TpuEnvs:
     SGLANG_DISAGG_PREFIX_PULL_MIN_TOKENS = EnvInt(0)
     SGLANG_DISAGG_PREFIX_PULL_MAX_POOL_FRACTION = EnvFloat(0.5)
     SGLANG_DISAGG_PREFIX_PULL_MIN_FREE_FRACTION = EnvFloat(0.25)
+    SGLANG_DISAGG_PREFIX_VICTIM_PUSH = EnvBool(False)
 
     @classmethod
     def names(cls) -> list[str]:

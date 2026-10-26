@@ -14,7 +14,9 @@ import os
 from collections.abc import Sequence
 
 from sglang.srt.environ import envs
+
 from sglang_tpu._logging import get_logger
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = get_logger(__name__)
 
@@ -83,6 +85,7 @@ def _register_tpu_sampler_backend() -> None:
         return
 
     from sglang.srt.layers.sampler import register_sampler_backend
+
     from sglang_tpu.sampler import TpuSampler
 
     register_sampler_backend("tpu", TpuSampler)
@@ -436,7 +439,6 @@ def _patch_compute_position_torch() -> None:
     _compute_position_torch_patched = True
 
     import torch
-
     from sglang.srt.model_executor import forward_batch_info
 
     def compute_position_torch_cpu_staged(
@@ -499,11 +501,10 @@ def _patch_torch_native_attn_backend() -> None:
     _torch_native_attn_backend_patched = True
 
     import torch
-    from torch.nn.functional import scaled_dot_product_attention
-
     from sglang.srt.layers.attention.torch_native_backend import (
         TorchNativeAttnBackend,
     )
+    from torch.nn.functional import scaled_dot_product_attention
 
     def _run_sdpa_forward_extend(
         self,
@@ -745,6 +746,7 @@ def _patch_future_map_direct_handoff() -> None:
     _future_map_direct_handoff_patched = True
 
     from sglang.srt.managers.overlap_utils import FutureMap
+
     from sglang_tpu.overlap_utils_tpu import (
         flush_direct_handoff_tpu,
         publish_tpu,
@@ -804,6 +806,7 @@ def _patch_raiden_is_load_back_event_done() -> None:
     _raiden_is_load_back_event_done_patched = True
 
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
     from sglang_tpu.raiden_hybrid_cache_controller import (
         TpuRaidenHybridCacheController,
     )
@@ -835,6 +838,7 @@ def _patch_prefill_transfer_finish_from_raiden() -> None:
 
     from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
+
     from sglang_tpu.disaggregation.raiden.sender import RaidenKVSender
 
     # Each polled request's time stats -> its sender, during the poll only.
@@ -890,6 +894,26 @@ def _patch_hicache_write_back_copy_ahead() -> None:
     hicache_write_back_copy_ahead.install()
 
 
+def _patch_pd_victim_push() -> None:
+    """Make decode RAM the cache tier below prefill RAM.
+
+    Why: core has no disaggregation queue/cache lifecycle extension yet.
+    How: install the small wrappers listed in pd_victim_push._patch_targets.
+    Upstream PR or issue: none yet; tracked with the experimental module.
+    Remove when: equivalent lifecycle callbacks are available upstream.
+    """
+    # Off: not even the module's imports.
+    if not tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get():
+        return
+    if not tpu_envs.SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX.get():
+        raise ValueError(
+            "Victim prefix caching requires SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1"
+        )
+    from sglang_tpu import pd_victim_push
+
+    pd_victim_push.install()
+
+
 def _patch_pd_decode_async_prefill_info() -> None:
     """Fetch PD prefill parallel info off the decode scheduler thread.
 
@@ -929,6 +953,7 @@ def _patch_scheduler_reject_prompt_logprob() -> None:
     and forward cannot disagree.
     """
     from sglang.srt.managers.scheduler import Scheduler
+
     from sglang_tpu.compilation.compiled_forward_shim import CompiledForwardShim
 
     original = Scheduler._add_request_to_queue
@@ -977,6 +1002,7 @@ def apply_tpu_patches() -> None:
     _patch_prefill_transfer_finish_from_raiden()
     _patch_pd_decode_swa_hicache()
     _patch_hicache_write_back_copy_ahead()
+    _patch_pd_victim_push()
     _patch_pd_decode_async_prefill_info()
     _patch_host_heap_trim()
     _patch_profile_auto()

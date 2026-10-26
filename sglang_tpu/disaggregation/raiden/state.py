@@ -6,7 +6,7 @@ manager because they can survive protocol-state cleanup.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 
 @dataclass
@@ -87,6 +87,10 @@ class PrefillState:
     prefix_swa_ready: Dict[int, Tuple[str, int, str, int, int]] = field(
         default_factory=dict
     )
+    # Victim push: the decode's answers, by push seq.
+    victim_acks: Dict[int, bool] = field(default_factory=dict)
+    # Registrations protect source pages independently of room cleanup/ACKs.
+    victim_reads: Dict[int, Set[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -145,3 +149,5 @@ class DecodeState:
     prefill_addr: Dict[int, str] = field(default_factory=dict)
     # Hybrid sliding-window models: (swa_first_page, window page ids) offered.
     prefix_swa_blocks: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    # Victim push: pushes received and not yet taken, by (prefill, seq).
+    victim_pushes: Dict[Tuple[str, int], Any] = field(default_factory=dict)

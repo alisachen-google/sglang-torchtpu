@@ -90,6 +90,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimPush,
 )
 from sglang_tpu.disaggregation.raiden.state import DecodeState, PrefillState
 from sglang_tpu.envs import envs as tpu_envs
@@ -178,6 +180,8 @@ class RaidenKVManager(
             PrefixOffer.TAG: self._on_prefix_offer,
             PrefixPull.TAG: self._on_prefix_pull,
             PrefixReady.TAG: self._on_prefix_ready,
+            VictimPush.TAG: self._on_victim_push,
+            VictimAck.TAG: self._on_victim_ack,
         }
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
@@ -637,9 +641,16 @@ class RaidenKVManager(
         """Id of the prefix pull's sliding-window read, on the SWA engines."""
         return f"{room}#pxs"
 
+    def _victim_req_id(self, seq: int) -> str:
+        return f"v{self.victim_namespace}-{seq}#vx"
+
+    def _victim_swa_req_id(self, seq: int) -> str:
+        return self._victim_req_id(seq) + "s"
+
     @staticmethod
     def _is_prefix_pull_read(key: str) -> bool:
-        return key.endswith(("#px", "#pxs"))
+        # Pushed-session reads are side reads too: a failure fails no room.
+        return key.endswith(("#px", "#pxs", "#vx", "#vxs"))
 
     def _drop_stale_prefix_completions_locked(self) -> None:
         """Forget served prefix reads of rooms that were already cleared; the
@@ -1063,6 +1074,13 @@ class RaidenKVManager(
         )
 
     def create_decode_prefix_puller(self, scheduler):
+        victim_push = tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get()
+        if self._prefill is not None and victim_push and (
+            not self.prefix_pull_active or self.pp_size != 1
+        ):
+            raise ValueError(
+                "Victim prefix caching requires enabled Raiden prefix pull, radix caching, PP=1, and no GDN/Mamba state"
+            )
         if (
             self._prefill is None
             or not self.prefix_pull_active
@@ -1071,7 +1089,28 @@ class RaidenKVManager(
             return None
         from sglang_tpu.disaggregation.raiden.prefix_pull import DecodePrefixPuller
 
-        return DecodePrefixPuller(
+        puller_cls = DecodePrefixPuller
+        if victim_push:
+            from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+                UnifiedTreeCore,
+            )
+            from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+            from sglang_tpu.pd_victim_push import VictimPrefixPuller
+
+            if not (
+                isinstance(scheduler.tree_cache, UnifiedRadixCache)
+                and isinstance(scheduler.tree_cache.tree_core, UnifiedTreeCore)
+            ):
+                raise ValueError(
+                    "Victim prefix caching requires the Python unified radix tree"
+                )
+            if scheduler.tree_cache.cache_controller is None:
+                raise ValueError(
+                    "Victim prefix caching requires --enable-hierarchical-cache on both roles"
+                )
+            puller_cls = VictimPrefixPuller
+        return puller_cls(
             kv_manager=self,
             scheduler=scheduler,
             swa_window=self.kv_args.sliding_window_size

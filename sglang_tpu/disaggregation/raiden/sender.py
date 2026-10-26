@@ -40,6 +40,8 @@ from sglang_tpu.disaggregation.raiden.serde import (
     ReshardReady,
     ReshardReq,
     RoomFailed,
+    VictimAck,
+    VictimPush,
     decode_text,
     read_aux_blob,
 )
@@ -539,6 +541,104 @@ class RaidenSenderMixin:
                 and room not in self._prefill.prefix_offer_taken
                 and room not in self._prefill.prefix_resolved
             )
+
+    # ----- victim push (pd_victim_push.py) -----------------------------------
+
+    def decode_peer(self, room: int) -> Optional[Tuple[str, int]]:
+        """(ip, port) of the decode rank whose PULL_REQ named the room."""
+        with self._state_lock:
+            return self._prefill.decode_addr.get(room)
+
+    def send_victim_push(
+        self,
+        *,
+        decode: Tuple[str, int],
+        seq: int,
+        tokens: List[int],
+        blocks: List[int],
+        swa_blocks: List[int],
+        extra_key=None,
+        cache_salt=None,
+        is_eagle=False,
+    ) -> bool:
+        """Publish a bounded, incarnation-qualified export independent of requests."""
+        if not blocks or (swa_blocks and self._swa_engine is None):
+            return False
+        req_id = self._victim_req_id(seq)
+        swa_req_id = self._victim_swa_req_id(seq) if swa_blocks else ""
+        uuid = secrets.randbelow((1 << 63) - 1) + 1
+        swa_uuid = secrets.randbelow((1 << 63) - 1) + 1 if swa_blocks else 0
+        with self._state_lock:
+            self._prefill.victim_reads[seq] = set()
+        try:
+            for engine, rid, lease, pages in (
+                (self._ensure_engine(), req_id, uuid, blocks),
+                (self._swa_engine, swa_req_id, swa_uuid, swa_blocks),
+            ):
+                if not pages:
+                    continue
+                with self._state_lock:
+                    self._prefill.victim_reads[seq].add(rid)
+                try:
+                    accepted = engine.register_read(rid, lease, pages)
+                except Exception:
+                    with self._state_lock:
+                        self._prefill.victim_reads[seq].discard(rid)
+                    raise
+                if not accepted:
+                    with self._state_lock:
+                        self._prefill.victim_reads[seq].discard(rid)
+                    return False
+            self._send_multipart_locked(
+                _tcp_endpoint(ip=decode[0], port=decode[1]),
+                VictimPush(
+                    prefill=self.victim_namespace,
+                    seq=seq,
+                    ack_endpoint=_tcp_endpoint(ip=self.local_ip, port=self.rank_port),
+                    tokens=tokens,
+                    extra_key=extra_key,
+                    cache_salt=cache_salt,
+                    is_eagle=is_eagle,
+                    endpoint=self.raiden_endpoint or "",
+                    req_id=req_id,
+                    uuid=uuid,
+                    blocks=blocks,
+                    swa_endpoint=(self.swa_raiden_endpoint or "") if swa_blocks else "",
+                    swa_req_id=swa_req_id,
+                    swa_uuid=swa_uuid,
+                    swa_blocks=swa_blocks,
+                ).to_frames(),
+            )
+        except Exception as exc:
+            logger.warning("Raiden victim push %s failed: %s", req_id, exc)
+            return False
+        return True
+
+    def victim_send_settled(self, seq: int) -> bool:
+        with self._state_lock:
+            return all(
+                rid in self._completed_send or rid in self._native_failed
+                for rid in self._prefill.victim_reads.get(seq, ())
+            )
+
+    def _on_victim_ack(self, msg: List[bytes]) -> None:
+        ack = VictimAck.from_frames(msg)
+        with self._state_lock:
+            if ack.seq in self._prefill.victim_reads:
+                self._prefill.victim_acks[ack.seq] = ack.stored
+
+    def take_victim_ack(self, seq: int) -> Optional[bool]:
+        """The decode's answer to push ``seq`` on this rank, handed out once."""
+        with self._state_lock:
+            return self._prefill.victim_acks.pop(seq, None)
+
+    def forget_victim_reads(self, seq: int) -> None:
+        with self._state_lock:
+            for rid in self._prefill.victim_reads.pop(seq, ()):
+                self._completed_send.discard(rid)
+                self._native_failed.discard(rid)
+                self._send_done_at.pop(rid, None)
+            self._prefill.victim_acks.pop(seq, None)
 
     def take_prefix_offer(self, room: int) -> Optional[Tuple[int, List[int]]]:
         """The decode's (prefix_tokens, page ids) offer, handed out once."""
