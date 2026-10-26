@@ -152,7 +152,12 @@ class TpuEnvs:
     # SWA pool holds one window per cached path.
     SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP = EnvBool(False)
 
-    # Export cold prefill host-cache branches to the same P/D pair's decode.
+    # Raiden P/D prefix reuse. TPU-only while host exports and native transfer
+    # registration remain owned by this backend.
+    SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX = EnvBool(False)
+    SGLANG_DISAGG_PREFIX_PULL_MIN_TOKENS = EnvInt(0)
+    SGLANG_DISAGG_PREFIX_PULL_MAX_POOL_FRACTION = EnvFloat(0.5)
+    SGLANG_DISAGG_PREFIX_PULL_MIN_FREE_FRACTION = EnvFloat(0.25)
     SGLANG_DISAGG_PREFIX_VICTIM_PUSH = EnvBool(False)
 
     @classmethod
