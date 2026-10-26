@@ -1380,8 +1380,6 @@ class RaidenKVManager(
                     self._prefill.prefix_pull_asked,
                     self._prefill.prefix_ready,
                     self._prefill.prefix_pull_reads,
-                    self._prefill.prefix_swa_offers,
-                    self._prefill.prefix_swa_ready,
                 ):
                     table.pop(room, None)
                 for table in (

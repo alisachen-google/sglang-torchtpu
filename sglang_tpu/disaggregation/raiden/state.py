@@ -6,7 +6,10 @@ manager because they can survive protocol-state cleanup.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Set, Tuple
+
+if TYPE_CHECKING:
+    from sglang_tpu.disaggregation.raiden.serde import PrefixOffer, PrefixReady
 
 
 @dataclass
@@ -73,22 +76,14 @@ class PrefillState:
     # the puller; the range asked for; READY replies; the read in flight; and
     # rooms whose pull is settled either way.
     prefix_offer_since: Dict[int, float] = field(default_factory=dict)
-    prefix_offers: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    prefix_offers: Dict[int, "PrefixOffer"] = field(default_factory=dict)
     prefix_offer_taken: Set[int] = field(default_factory=set)
     prefix_pull_asked: Dict[int, Tuple[int, int]] = field(default_factory=dict)
-    prefix_ready: Dict[int, Tuple[str, int, str, int, int]] = field(
-        default_factory=dict
-    )
+    prefix_ready: Dict[int, "PrefixReady"] = field(default_factory=dict)
     prefix_pull_reads: Dict[int, str] = field(default_factory=dict)
     prefix_resolved: Set[int] = field(default_factory=set)
-    # Hybrid sliding-window models: the offer's (swa_first_page, window page
-    # ids) and READY's (swa_req_id, swa_uuid, swa_endpoint, first, pages).
-    prefix_swa_offers: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
-    prefix_swa_ready: Dict[int, Tuple[str, int, str, int, int]] = field(
-        default_factory=dict
-    )
-    # Victim push: offers awaiting the decode, and its answers, by push seq.
-    victim_open: Set[int] = field(default_factory=set)
+    # Keep each wire descriptor intact: FULL/SWA fields share one lifetime.
+    # Victim seq presence means live; None means no unconsumed ACK yet.
     victim_acks: Dict[int, Any] = field(default_factory=dict)
 
 

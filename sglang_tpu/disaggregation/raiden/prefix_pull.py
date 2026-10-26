@@ -184,6 +184,12 @@ class DecodePrefixPuller:
         in the same step. ``waiting_reqs`` is the scheduler's waiting queue.
         """
         self.resolve_deferred_releases()
+        self._advance_requests(reqs, waiting_reqs=waiting_reqs)
+
+    def _advance_requests(
+        self, reqs: List[Req], *, waiting_reqs: Sequence[Req]
+    ) -> None:
+        """Advance requests after rank-synchronous external ownership cleanup."""
         self._unpin_departed(queued_reqs=[*reqs, *waiting_reqs])
         if not reqs:
             return

@@ -500,15 +500,7 @@ class RaidenSenderMixin:
                 or offer.room not in self._prefill.prefix_offer_since
             ):
                 return
-            self._prefill.prefix_offers[offer.room] = (
-                offer.prefix_tokens,
-                list(offer.blocks),
-            )
-            if offer.swa_blocks:
-                self._prefill.prefix_swa_offers[offer.room] = (
-                    offer.swa_first_page,
-                    list(offer.swa_blocks),
-                )
+            self._prefill.prefix_offers[offer.room] = offer
             if not offer.blocks:
                 self._prefill.prefix_resolved.add(offer.room)
 
@@ -520,20 +512,7 @@ class RaidenSenderMixin:
                 or ready.room not in self._prefill.prefix_pull_asked
             ):
                 return
-            self._prefill.prefix_ready[ready.room] = (
-                ready.req_id,
-                ready.uuid,
-                ready.endpoint,
-                ready.first_page,
-                ready.num_pages,
-            )
-            self._prefill.prefix_swa_ready[ready.room] = (
-                ready.swa_req_id,
-                ready.swa_uuid,
-                ready.swa_endpoint,
-                ready.swa_first_page,
-                ready.swa_num_pages,
-            )
+            self._prefill.prefix_ready[ready.room] = ready
 
     def prefix_offer_available(self, room: int) -> bool:
         with self._state_lock:
@@ -569,7 +548,7 @@ class RaidenSenderMixin:
         if not blocks:
             return False
         with self._state_lock:
-            self._prefill.victim_open.add(seq)
+            self._prefill.victim_acks[seq] = None
         try:
             self._send_multipart_locked(
                 _tcp_endpoint(ip=decode[0], port=decode[1]),
@@ -606,17 +585,19 @@ class RaidenSenderMixin:
     def _on_victim_ack(self, msg: List[bytes]) -> None:
         ack = VictimAck.from_frames(msg)
         with self._state_lock:
-            if ack.seq in self._prefill.victim_open:
+            if ack.seq in self._prefill.victim_acks:
                 self._prefill.victim_acks[ack.seq] = ack
 
     def take_victim_ack(self, seq: int) -> Optional[VictimAck]:
         """The decode's answer to push ``seq`` on this rank, handed out once."""
         with self._state_lock:
-            return self._prefill.victim_acks.pop(seq, None)
+            ack = self._prefill.victim_acks.get(seq)
+            if ack is not None:
+                self._prefill.victim_acks[seq] = None
+            return ack
 
     def forget_victim(self, seq: int) -> None:
         with self._state_lock:
-            self._prefill.victim_open.discard(seq)
             self._prefill.victim_acks.pop(seq, None)
 
     def take_prefix_offer(self, room: int) -> Optional[Tuple[int, List[int]]]:
@@ -630,12 +611,13 @@ class RaidenSenderMixin:
             ):
                 return None
             self._prefill.prefix_offer_taken.add(room)
-            return offer
+            return offer.prefix_tokens, list(offer.blocks)
 
     def prefix_swa_offer(self, room: int) -> Tuple[int, List[int]]:
         """The offer's (swa_first_page, window page ids); (0, []) without one."""
         with self._state_lock:
-            return self._prefill.prefix_swa_offers.get(room, (0, []))
+            offer = self._prefill.prefix_offers.get(room)
+            return (offer.swa_first_page, list(offer.swa_blocks)) if offer else (0, [])
 
     def resolve_prefix_pull(self, room: int) -> None:
         """The pull is settled, pulled or not; the room may leave Bootstrapping."""
@@ -696,12 +678,30 @@ class RaidenSenderMixin:
     def prefix_pull_ready(self, room: int) -> Optional[Tuple[str, int, str, int, int]]:
         """The decode's READY reply (req_id, uuid, endpoint, first, pages), if in."""
         with self._state_lock:
-            return self._prefill.prefix_ready.get(room)
+            ready = self._prefill.prefix_ready.get(room)
+            if ready is None:
+                return None
+            return (
+                ready.req_id,
+                ready.uuid,
+                ready.endpoint,
+                ready.first_page,
+                ready.num_pages,
+            )
 
     def prefix_swa_ready(self, room: int) -> Optional[Tuple[str, int, str, int, int]]:
         """READY's window part (swa_req_id, swa_uuid, swa_endpoint, first, pages)."""
         with self._state_lock:
-            return self._prefill.prefix_swa_ready.get(room)
+            ready = self._prefill.prefix_ready.get(room)
+            if ready is None:
+                return None
+            return (
+                ready.swa_req_id,
+                ready.swa_uuid,
+                ready.swa_endpoint,
+                ready.swa_first_page,
+                ready.swa_num_pages,
+            )
 
     def start_prefix_pull(
         self,
@@ -762,7 +762,6 @@ class RaidenSenderMixin:
                 return "retry"
             self._prefill.prefix_pull_reads[room] = req_id
             self._prefill.prefix_ready.pop(room, None)
-            self._prefill.prefix_swa_ready.pop(room, None)
         try:
             engine.start_read(req_id, uuid, endpoint, remote, local)
         except Exception as exc:

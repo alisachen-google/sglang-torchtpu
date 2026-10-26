@@ -333,14 +333,7 @@ class TestPrefillPusher(CustomTestCase):
         self.peers = {}
         self.mgr.decode_peer.side_effect = lambda room: self.peers.get(room)
         self.pusher = victim_push.PrefillPusher(
-            SimpleNamespace(
-                _mgr=self.mgr,
-                _tree_cache=self.cache,
-                _allocator=self.allocator,
-                _page_size=1,
-                _groups=[],
-                _window_pages=None,
-            )
+            kv_manager=self.mgr, cache=self.cache, groups=[]
         )
         self.a, self.b = list(range(100, 108)), list(range(200, 208))
         for room, tokens, decode in (
@@ -632,9 +625,7 @@ class TestHybridVictims(CustomTestCase):
         mgr.decode_peer.return_value = ("10.0.0.1", 5001)
         mgr.take_victim_ack.side_effect = lambda seq: acks.pop(seq, None)
         pusher = victim_push.PrefillPusher(
-            SimpleNamespace(
-                _mgr=mgr, _tree_cache=receiver._cache, _page_size=64, _groups=[]
-            )
+            kv_manager=mgr, cache=receiver._cache, groups=[]
         )
         pusher.record(SimpleNamespace(bootstrap_room=1, origin_input_ids=offer.tokens))
         return receiver, pusher, mgr, acks

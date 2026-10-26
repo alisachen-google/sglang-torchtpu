@@ -243,10 +243,8 @@ class _Push(msgspec.Struct):
     is_eagle: bool = False
     sent_at: float = 0.0
     # Refused or timed-out offers still drain their native registrations.
-    state: str = "offered"
     swa_pages: List[int] = []
     uuid: int = 0
-    ok: Optional[bool] = None
     offered: bool = False
     acknowledged: Optional[bool] = None
     transfers: List[Tuple[Any, str]] = []
@@ -264,11 +262,17 @@ def _transfer_uuid(prefill: str, seq: int) -> int:
 class PrefillPusher:
     """Pushes host-backed sessions near eviction to their decodes."""
 
-    def __init__(self, puller: DecodePrefixPuller) -> None:
-        self._mgr = puller._mgr
-        self._cache = puller._tree_cache
-        self._page_size = puller._page_size
-        self._groups = list(puller._groups)
+    def __init__(
+        self,
+        *,
+        kv_manager: RaidenKVManager,
+        cache: UnifiedRadixCache,
+        groups: Sequence[Any],
+    ) -> None:
+        self._mgr = kv_manager
+        self._cache = cache
+        self._page_size = int(cache.page_size)
+        self._groups = list(groups)
         self._host_pool = _anchor_host_pool(self._cache)
         self._swa_host_pool = _swa_host_pool(self._cache)
         self._window_tokens = _window_tokens(self._cache, self._page_size)
@@ -326,6 +330,10 @@ class PrefillPusher:
     def step(self) -> None:
         """Every bootstrap step, every rank; no tree decision uses a local clock."""
         self._settle()
+        self._start_exports()
+
+    def _start_exports(self) -> None:
+        """Select new work after the coordinator has drained prior ownership."""
         eligible = int(
             len(self._pushes) < _MAX_INFLIGHT and self._under_host_pressure()
         )
@@ -338,7 +346,6 @@ class PrefillPusher:
         deadline = time.monotonic() + _DRAIN_TIMEOUT_S
         for push in self._pushes.values():
             push.acknowledged = False
-            push.state = "draining"
         while True:
             empty, expired = _all_ranks_reduce(
                 self._groups,
@@ -361,26 +368,24 @@ class PrefillPusher:
         pushes = list(self._pushes.values())
         rows = []
         for push in pushes:
-            if push.state == "offered":
+            if push.acknowledged is None:
                 ack = self._mgr.take_victim_ack(push.seq)
                 if ack is not None:
                     push.acknowledged = ack.stored
-                    push.state = "draining"
                 elif now - push.sent_at > _ACK_TIMEOUT_S:
                     push.acknowledged = False
-                    push.state = "draining"
             outcomes = [
                 transfer.poll_transfer(req_id) for transfer, req_id in push.transfers
             ]
             if "failed" in outcomes:
                 push.acknowledged = False
-                push.state = "draining"
-            if push.state == "draining" and all(outcomes):
-                push.ok = push.acknowledged is True and all(
-                    outcome == "sent" for outcome in outcomes
-                )
-                push.state = "done"
-            rows.append([int(push.state == "done"), int(push.ok is True)])
+            settled = push.acknowledged is not None and all(outcomes)
+            ok = (
+                settled
+                and push.acknowledged is True
+                and all(outcome == "sent" for outcome in outcomes)
+            )
+            rows.append([int(settled), int(ok)])
         agreed = _all_ranks_reduce(self._groups, rows, dist.ReduceOp.MIN)
         for push, (settled, ok) in zip(pushes, agreed):
             if not settled:
@@ -521,7 +526,6 @@ class PrefillPusher:
         )[0][0]
         if not registered:
             push.acknowledged = False
-            push.state = "draining"
             return
         push.offered = self._mgr.send_victim_push(
             decode=decode,
@@ -542,7 +546,6 @@ class PrefillPusher:
         )
         if not push.offered:
             push.acknowledged = False
-            push.state = "draining"
 
     def _pick(self):
         """Oldest host-backed leaf owned by a known decode."""
@@ -915,32 +918,46 @@ class DecodeReceiver:
         self.stats["landed_tokens"] += num_tokens - result.prefix_len
 
 
-class VictimPrefixPuller(DecodePrefixPuller):
-    """Prefill orchestration selected by Raiden's existing backend factory."""
+class VictimPrefixPuller:
+    """Compose recall and export without coupling their ownership records."""
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.pusher = PrefillPusher(self)
+    def __init__(self, *, kv_manager, scheduler, swa_window=None):
+        self.recall = DecodePrefixPuller(
+            kv_manager=kv_manager, scheduler=scheduler, swa_window=swa_window
+        )
+        self.pusher = PrefillPusher(
+            kv_manager=kv_manager,
+            cache=scheduler.tree_cache,
+            groups=_cpu_groups(scheduler),
+        )
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        return self.recall.stats
 
     def commit(self, req):
-        super().commit(req)
+        self.recall.commit(req)
         self.pusher.record(req)
 
     def advance(self, reqs, *, waiting_reqs=()):
-        super().advance(reqs, waiting_reqs=waiting_reqs)
-        self.pusher.step()
+        # Keep cleanup before tree decisions, with one export-settle per tick.
+        self.resolve_deferred_releases()
+        self.recall._advance_requests(reqs, waiting_reqs=waiting_reqs)
+        self.pusher._start_exports()
+
+    def release(self, req):
+        self.recall.release(req)
 
     def has_pending_deferred_releases(self) -> bool:
-        return super().has_pending_deferred_releases() or bool(self.pusher._pushes)
+        return self.recall.has_pending_deferred_releases() or bool(self.pusher._pushes)
 
     def resolve_deferred_releases(self) -> None:
-        super().resolve_deferred_releases()
-        # Paused and empty control ticks must retire existing exports too.
+        self.recall.resolve_deferred_releases()
         self.pusher._settle()
 
     def release_all(self):
         self.pusher.release_all()
-        super().release_all()
+        self.recall.release_all()
 
 
 # ---------------------------------------------------------------------------
