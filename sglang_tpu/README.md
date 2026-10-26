@@ -127,3 +127,36 @@ prepares patches. Live check:
 [`test_tpu_muse_spark_mm_pd_multihost.py`](../test/registered/tpu/e2e/test_tpu_muse_spark_mm_pd_multihost.py)
 (images and video over P/D), with `SGLANG_TPU_USE_LIVE_SERVER=1` and
 `BASE_URL` pointing at the router.
+
+
+## Experimental P/D victim prefix cache: FULL-only DRAM spill
+
+Prefill remains the primary prefix cache. Before host pressure discards a cold
+cached branch, it registers pinned FULL KV host pages with
+`register_read(source="host")` and offers them to the decode that served that
+branch. Decode pulls into its existing HiCache host pool with
+`start_read(destination="host", local_host_block_ids=...)`, then inserts the
+victim as a host-only prefix. No HBM or transient staging slot is needed for
+this spill. Enable HiCache with `--enable-hierarchical-cache
+--hicache-io-backend raiden` on both roles, decode radix caching with
+`--disaggregation-decode-enable-radix-cache`, and
+`SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1` on both roles.
+
+This first milestone supports FULL-only models. Hybrid SWA storage follows in
+the next milestone; reverse recall into prefill is introduced separately after
+that. The feature flag defaults to disabled. The implementation requires the
+Python unified radix tree, matching P/D attention TP/CP geometry, PP=1, and no
+GDN/Mamba state. It is experimental and has no new live TPU validation.
+
+Both roles require matching tpu-sync Python/native artifacts from
+[`759530c7fb0a5f7c38114187e1bcde745f709f24`](https://github.com/alisachen-google/h2h/commit/759530c7fb0a5f7c38114187e1bcde745f709f24).
+The host pool exposes a positive control port serving its existing allocations.
+Sources stay pinned and destinations stay allocated until native terminal
+completion, including rejected and expired offers. All ranks agree before
+publishing a victim. Empty and paused scheduler ticks drain accepted ownership;
+a cache reset must wait for those reads to finish.
+
+The native session deadline alone does not interrupt blocked TCP I/O. Configure
+positive native socket read/write/ACK timeouts on both roles as well as the
+session timeout. Even after a timeout, terminal native completion is required
+before reusing pages. No benchmark source or performance claim is included.
