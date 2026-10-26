@@ -143,6 +143,9 @@ class TpuEnvs:
     # chunks. 0: evictions back up their victims synchronously, as upstream does.
     SGLANG_TPU_HICACHE_WRITE_BACK_COPY_AHEAD_TOKENS = EnvInt(None)
 
+    # Export cold prefill host-cache branches to the same P/D pair's decode.
+    SGLANG_DISAGG_PREFIX_VICTIM_PUSH = EnvBool(False)
+
     @classmethod
     def names(cls) -> list[str]:
         return sorted(
