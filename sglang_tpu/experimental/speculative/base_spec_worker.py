@@ -166,6 +166,8 @@ class TpuSpecWorker(BaseSpecWorker):
     and result packing are shared.
     """
 
+    supports_logprobs = False
+
     def __init__(
         self,
         target_worker: TpModelWorker,
@@ -447,7 +449,6 @@ class TpuSpecWorker(BaseSpecWorker):
         Noop: never.
         """
 
-    @abstractmethod
     def make_verify_input(
         self, *, batch: ScheduleBatch, verify_tokens: torch.Tensor, rows: VerifyRows
     ) -> SpecInput:
@@ -455,8 +456,10 @@ class TpuSpecWorker(BaseSpecWorker):
 
         Why: attention backends and the dynamo tracer key on the algorithm's
         verify type; its compile policy must warm the same structure.
-        Noop: never.
+        Workers using the shared verify or idle-verify path must implement this.
+        A custom verify may construct its spec_info directly.
         """
+        raise NotImplementedError("Shared verification requires make_verify_input().")
 
     def make_dummy_carry(self, rows: int) -> Any:
         """A zero draft_carry of rows rows on device, shaped and typed like serving.
@@ -484,12 +487,18 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens = build_verify_tokens(
                 bucket.state.bonus_tokens, draft_result.draft_tokens
             )
+        spec_info = self.make_verify_input(
+            batch=batch,
+            verify_tokens=verify_tokens,
+            rows=rows,
+        )
         logits_output = self._forward_target_verify(
             batch=batch,
             bucket_state=bucket.state,
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
         )
         target_logits = logits_output.next_token_logits
         assert target_logits.shape[0] == draft_result.draft_tokens.shape[0] * (
@@ -840,6 +849,9 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=self.make_verify_input(
+                batch=batch, verify_tokens=verify_tokens, rows=rows
+            ),
         )
         site = SpecTpSyncSite.SPEC_ACCEPT_GREEDY
         padded_bs = state.seq_lens.shape[0]
@@ -1221,11 +1233,9 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ) -> ForwardBatch:
         """TARGET_VERIFY ForwardBatch already at the [pbs, N + 1] bucket; the shim pads nothing."""
-        spec_info = self.make_verify_input(
-            batch=batch, verify_tokens=verify_tokens, rows=rows
-        )
         batch.out_cache_loc = rows.flat_cache_locs
         with self._bucket_view(
             batch,
@@ -1277,6 +1287,7 @@ class TpuSpecWorker(BaseSpecWorker):
         verify_tokens: torch.Tensor,
         rows: VerifyRows,
         verify_input: TpuSpecVerifyInput,
+        spec_info: SpecInput,
     ) -> LogitsProcessorOutput:
         verify_forward_batch = self._build_verify_batch(
             batch=batch,
@@ -1284,6 +1295,7 @@ class TpuSpecWorker(BaseSpecWorker):
             verify_tokens=verify_tokens,
             rows=rows,
             verify_input=verify_input,
+            spec_info=spec_info,
         )
         # Keep logits/hidden on the batch bucket so the compiled accept op needs no re-pad.
         assert verify_forward_batch.spec_info is not None
@@ -1378,7 +1390,7 @@ class TpuSpecWorker(BaseSpecWorker):
             raise NotImplementedError("TpuSpecWorker under PP only extends.")
         if batch.has_grammar:
             raise NotImplementedError("TpuSpecWorker does not support grammar.")
-        if batch.return_logprob:
+        if batch.return_logprob and not self.supports_logprobs:
             raise NotImplementedError("TpuSpecWorker does not support logprobs.")
         sampling_info = batch.sampling_info
         if sampling_info is None:

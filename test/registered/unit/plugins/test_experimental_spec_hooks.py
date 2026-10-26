@@ -24,10 +24,13 @@ from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang_tpu.envs import envs
 from sglang_tpu.experimental import register_host_batch_padder, uses_host_batch
 from sglang_tpu.experimental.sampling.sampling_batch_info import HostPaddedSamplingInfo
+from sglang_tpu.experimental.speculative import base_spec_worker, draft_info
 from sglang_tpu.experimental.speculative.block_info import (
     HostPaddedBlockDraftInput,
 )
+from sglang_tpu.experimental.speculative.block_spec_worker import TpuBlockSpecWorker
 from sglang_tpu.experimental.speculative.chain_info import HostPaddedChainDraftInput
+from sglang_tpu.experimental.speculative.spec_types import DraftResult
 from sglang_tpu.hooks.experimental_spec import (
     alloc_extend,
     hook_specs,
@@ -36,6 +39,10 @@ from sglang_tpu.hooks.experimental_spec import (
 )
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class _LogprobBlockSpecWorker(TpuBlockSpecWorker):
+    supports_logprobs = True
 
 
 def _pad(bs):
@@ -85,6 +92,56 @@ def _state(rows):
 
 
 class TestExperimentalSpecHooks(CustomTestCase):
+    def test_verify_passes_current_draft_metadata_to_target(self):
+        worker = object.__new__(TpuBlockSpecWorker)
+        worker.num_verify_rows = 2
+        worker._simulate_acc_len = 0
+        worker._tp_sync = MagicMock()
+        logits = SimpleNamespace(next_token_logits=torch.zeros(2, 4))
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=MagicMock(
+                return_value=SimpleNamespace(logits_output=logits)
+            )
+        )
+        draft = DraftResult(
+            torch.tensor([[1]]), None, torch.tensor([1]), torch.tensor([0, 1])
+        )
+        bucket = SimpleNamespace(
+            state=SimpleNamespace(seq_lens=torch.tensor([4])),
+            live_mask=torch.tensor([True]),
+            temperatures=None,
+            top_ks=None,
+        )
+        metadata = SimpleNamespace()
+        accepted = object()
+        batch, rows, addressing = object(), object(), object()
+        with (
+            patch.object(worker, "make_verify_input", return_value=metadata) as make,
+            patch.object(
+                worker,
+                "_build_verify_batch",
+                return_value=SimpleNamespace(spec_info=metadata),
+            ) as build,
+            patch.object(
+                base_spec_worker,
+                "accept_drafts_greedy",
+                return_value=(torch.tensor([1]), torch.tensor([2])),
+            ),
+            patch.object(base_spec_worker, "finalize_accept", return_value=accepted),
+        ):
+            result = worker.verify(batch, bucket, rows, draft, addressing)
+        make.assert_called_once_with(
+            batch=batch,
+            verify_tokens=draft.verify_tokens,
+            rows=rows,
+        )
+        self.assertIs(build.call_args.kwargs["spec_info"], metadata)
+        self.assertTrue(metadata.keep_outputs_padded)
+        self.assertEqual(result, (logits, accepted))
+        target = worker.target_worker.forward_batch_generation.call_args.kwargs
+        self.assertIs(target["forward_batch"].spec_info, metadata)
+        self.assertTrue(target["is_verify"])
+
     def setUp(self):
         super().setUp()
         # enterContext is 3.11+; CI runs 3.10.
@@ -1204,9 +1261,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
         """prepare_for_decode reserves 2 * N tokens past the committed length,
         plans the verify window on host from the committed lengths, and refuses
         a device-resident pool."""
-        from sglang_tpu.experimental.speculative import draft_info
-
         page_size, num_draft_tokens = 4, 3
+        worker_factory = MagicMock(return_value=TpuBlockSpecWorker)
         reqs = [
             SimpleNamespace(
                 kv=SimpleNamespace(kv_committed_len=c, kv_allocated_len=a),
@@ -1231,6 +1287,8 @@ class TestExperimentalSpecHooks(CustomTestCase):
             enable_overlap=True,
             return_logprob=False,
             has_grammar=False,
+            sampling_info=None,
+            spec_algorithm=SimpleNamespace(create_worker=worker_factory),
         )
         allocations = []
         spec = SimpleNamespace(
@@ -1241,8 +1299,10 @@ class TestExperimentalSpecHooks(CustomTestCase):
             bonus_tokens=torch.zeros(2, dtype=torch.int64),
             new_seq_lens=torch.zeros(2, dtype=torch.int64),
         )
+        server_args = object()
         with (
             patch.object(draft_info, "get_spec", return_value=spec),
+            patch.object(draft_info, "get_server_args", return_value=server_args),
             patch.object(
                 draft_info,
                 "allocate_and_assign_decode_cache",
@@ -1266,11 +1326,24 @@ class TestExperimentalSpecHooks(CustomTestCase):
             self.assertEqual(draft.tpu_committed_lens.tolist(), [5, 10])
             self.assertEqual(draft.tpu_req_pool_indices.tolist(), [1, 2])
 
-            # Logprobs can commit past the window's bound: stay on the sync path.
+            # Request validation and KV planning use the selected worker's
+            # capability, including an input constructed outside the worker.
             batch.return_logprob = True
+            worker = object.__new__(TpuBlockSpecWorker)
+            with self.assertRaisesRegex(NotImplementedError, "logprobs"):
+                worker._check_supported(batch=batch, pp_proxy_tensors=None)
             draft.prepare_for_decode(batch)
             self.assertFalse(draft.tpu_host_seq_lens_is_committed)
             self.assertIsNone(draft.tpu_verify_cache_candidates)
+            # Scoring can use the same window when the algorithm keeps the
+            # ordinary N + 1 token commit bound.
+            worker_factory.return_value = _LogprobBlockSpecWorker
+            worker = object.__new__(_LogprobBlockSpecWorker)
+            worker._check_supported(batch=batch, pp_proxy_tensors=None)
+            draft.prepare_for_decode(batch)
+            self.assertTrue(draft.tpu_host_seq_lens_is_committed)
+            self.assertEqual(draft.tpu_verify_cache_candidates.shape, (2, 6))
+            worker_factory.assert_called_with(server_args)
 
             batch.req_to_token_pool.host_resident = False
             with self.assertRaisesRegex(RuntimeError, "host-resident"):
