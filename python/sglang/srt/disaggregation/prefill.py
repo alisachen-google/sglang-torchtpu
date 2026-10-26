@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -229,6 +228,11 @@ class PrefillBootstrapQueue:
                     "SGLANG_DISAGG_STAGING_BUFFER does not support pp_size > 1."
                 )
         self.kv_manager = self._init_kv_manager()
+        # Pulls prompt KV the decode already holds before the prefill computes
+        # it; None unless the transfer backend supports it.
+        self.decode_prefix_puller = self.kv_manager.create_decode_prefix_puller(
+            scheduler
+        )
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.scheduler.kv_checksum_computer = KvChecksumComputer(
@@ -504,6 +508,11 @@ class PrefillBootstrapQueue:
         failed_reqs = []
         indices_to_remove = set()
 
+        if self.decode_prefix_puller is not None:
+            self.decode_prefix_puller.advance(
+                self.queue, waiting_reqs=self.scheduler.waiting_queue
+            )
+
         if len(self.queue) == 0:
             if return_failed_reqs is False:
                 return []
@@ -539,6 +548,8 @@ class PrefillBootstrapQueue:
                 continue
 
             if poll == KVPoll.Failed:
+                if self.decode_prefix_puller is not None:
+                    self.decode_prefix_puller.release(req)
                 self.scheduler.handle_bootstrap_failure(req)
                 indices_to_remove.add(i)
                 failed_reqs.append(req)
@@ -559,6 +570,9 @@ class PrefillBootstrapQueue:
                 ):
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
+                    if self.decode_prefix_puller is not None:
+                        # Leaving early to compute: a pull in flight is dropped.
+                        self.decode_prefix_puller.release(req)
                     req.prefill_attempt_count += 1
                     bootstrapped_reqs.append(req)
                     indices_to_remove.add(i)
@@ -567,6 +581,10 @@ class PrefillBootstrapQueue:
                         self.scheduler.processed_tokens_counter
                     )
             elif poll == KVPoll.WaitingForInput:
+                if self.decode_prefix_puller is not None:
+                    # Every rank reached this state, so the tree insert below
+                    # runs in the same step on all of them.
+                    self.decode_prefix_puller.commit(req)
                 if should_force_retry(req):  # skip checking for testing
                     if not self.ensure_metadata_buffer(req):
                         continue  # no more metadata buffer
@@ -592,6 +610,8 @@ class PrefillBootstrapQueue:
             return bootstrapped_reqs, failed_reqs
 
     def release_memory_occupation(self):
+        if self.decode_prefix_puller is not None:
+            self.decode_prefix_puller.release_all()
         self.queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()

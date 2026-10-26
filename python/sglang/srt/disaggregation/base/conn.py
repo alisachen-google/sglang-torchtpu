@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
 import numpy.typing as npt
-
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
@@ -158,6 +157,11 @@ class BaseKVManager(ABC):
         """PP prefill, last stage: the deferred output send copied slot
         ``mb_id``'s sampled tokens to the host."""
 
+    def create_decode_prefix_puller(self, scheduler):
+        """Prefill side: the helper that pulls prompt KV the decode already
+        holds before the prefill computes it, or None when unsupported."""
+        return None
+
 
 class BaseKVSender(ABC):
     @abstractmethod
@@ -239,6 +243,23 @@ class BaseKVReceiver(ABC):
     def supports_host_destination(self) -> bool:
         """Whether this receiver's peer and layout support host KV destinations."""
         return False
+
+    @property
+    def prefix_offer_pending(self) -> bool:
+        """Whether the prefill waits for this decode to name the prompt prefix
+        pages it already holds (see offer_resident_prefix)."""
+        return False
+
+    def offer_resident_prefix(self, page_ids) -> None:
+        """Name the decode's device-resident prefix pages; no pages withdraws."""
+
+    def offer_window_prefix(self, *, tree_cache, allocator, req, window_size: int):
+        """Hybrid sliding-window models: lock and name the deepest prompt prefix
+        whose window this decode holds on device, or withdraw. Returns the
+        (node, receipt) tree lock to release once the request leaves the
+        transfer queue, or None."""
+        self.offer_resident_prefix([])
+        return None
 
     @abstractmethod
     def __init__(
