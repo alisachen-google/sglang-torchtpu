@@ -1,8 +1,8 @@
 # sglang_tpu: SGLang's TPU backend as an out-of-tree plugin
 
 All TPU-only code of `sglang-torchtpu` lives in this package (dist `sglang-tpu`).
-The sglang fork in `python/` shrinks toward a pinned upstream commit as its TPU
-edits move here or go upstream as seams. This file is the operational summary.
+The sglang fork in `python/` shrinks toward upstream as its TPU edits move here
+or go upstream as seams. This file is the operational summary.
 
 ## Install
 
@@ -115,8 +115,8 @@ the multi-host, P/D, accuracy, perf, combo and external lanes stay on mode A.
 
 `models/muse_spark.py` is the text decoder; `models/muse_spark_omni.py` adds the
 NaViT vision tower (adapted from upstream SGLang PR
-[#44666](https://github.com/sgl-project/sglang/pull/44666), commit
-`26305be7f410`) and is the registered `MuseSparkForConditionalGeneration`.
+[#44666](https://github.com/sgl-project/sglang/pull/44666)) and is registered as
+`MuseSparkForConditionalGeneration`.
 Image and video serving needs `--enable-multimodal`,
 `SGLANG_EXTERNAL_MM_MODEL_ARCH=MuseSparkForConditionalGeneration` and
 `SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE=sglang_tpu.multimodal`.
@@ -130,120 +130,38 @@ prepares patches. Live check:
 
 ## Experimental P/D victim prefix cache
 
-The v3 policy keeps prefill as the primary prefix cache. Before host pressure
-would discard an old cached branch, prefill exports its full KV and its ending
-SWA window to the decode that served that branch. Decode retains pushed victims;
-ordinary generation requests do not create another persistent radix-cache copy.
-A later prefill miss can pull the victim back through the existing Raiden prefix
-exchange. Different branches of a shared system prompt, cache salts, and adapter
-namespaces retain independent ownership.
+Prefill keeps the primary prefix cache and spills cold host-backed branches
+into Decode DRAM before eviction. FULL KV and its matching ending SWA window
+move directly between HiCache host pools. Later Prefill misses can recall them.
 
-For an experiment, enable HiCache on both roles with
-`--enable-hierarchical-cache --hicache-io-backend raiden` and enable decode radix
-caching with `--disaggregation-decode-enable-radix-cache`. Set on both roles:
+On both engines, enable:
 
-```bash
-SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1
-SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1
+```text
+--disaggregation-transfer-backend raiden
+--enable-hierarchical-cache --hicache-io-backend raiden
 ```
 
-For hybrid SWA models, also set
-`SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP=1` on prefill and size the decode
-window tier with `SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS=128` on decode. The latter
-is a count of windows; choose it together with the decode full-KV host budget.
-The default is zero, preserving the existing full-only host tier when this
-experiment is disabled. Both platform modes use the same implementation.
-
-The current path uses the Python unified radix tree, matching P/D attention-TP
-and context-parallel geometry, equal page sizes/layouts, and no pipeline or
-GDN/Mamba state transfer. Multiple decodes need session affinity so the next
-turn reaches its holder. This is an experimental implementation, not a newly
-validated support-matrix entry.
-
-Exports are independent of later requests and move RAM to RAM through the
-existing HiCache host-pool managers. Prefill registers pinned host pages with
-`register_read(source="host")` before offering them. Decode reserves host pages
-and pulls into them with `start_read(destination="host", local_host_block_ids=...)`.
-The received victim enters decode's radix cache as a host-only node; this
-transfer uses no HBM or transient staging slot on either side. At most four
-victims per engine are in flight. Every rank agrees on the selected branch,
-namespace, length and outcome before allocation or insertion; request labels
-carry a per-prefill incarnation so separate prefills and restarts cannot alias.
-
-Source pins and destination allocations remain live until native
-`poll_stats_with_details()` reports terminal completion, including after an
-offer is refused or expires. Native transfer deadlines use
-`SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S`. A wall-clock timeout alone never frees
-pages that a remote writer may still use. Cache reset/memory release waits for
-accepted reads to drain; an early attempt raises and can be retried. The wrapper
-owns completion polling for each host manager and retains reports for other
-in-flight victims.
-
-At native revision `759530c7`, a session deadline starts draining but does not
-interrupt a blocked TCP data operation. The socket I/O timeouts below default
-to disabled, so a paused peer can keep source pins and destination allocations
-live past the session deadline. Configure positive native I/O timeouts before
-starting both roles as well as setting the session timeout. These native names
-describe send/receive operations; set all nine on both roles because either
-role can send KV during spill or recall. For example, this Bash snippet keeps
-existing values and otherwise supplies a 60-second per-I/O budget:
+Also pass `--disaggregation-decode-enable-radix-cache` on Decode. Set on both:
 
 ```bash
-for raiden_io_timeout in \
-  TPU_RAIDEN_PREFILL_HANDSHAKE_ACK_READ_TIMEOUT_S \
-  TPU_RAIDEN_PREFILL_FINAL_ACK_READ_TIMEOUT_S \
-  TPU_RAIDEN_PREFILL_PAYLOAD_READ_TIMEOUT_S \
-  TPU_RAIDEN_PREFILL_HANDSHAKE_WRITE_TIMEOUT_S \
-  TPU_RAIDEN_PREFILL_PAYLOAD_WRITE_TIMEOUT_S \
-  TPU_RAIDEN_DECODE_HANDSHAKE_READ_TIMEOUT_S \
-  TPU_RAIDEN_DECODE_PAYLOAD_READ_TIMEOUT_S \
-  TPU_RAIDEN_DECODE_ACK_WRITE_TIMEOUT_S \
-  TPU_RAIDEN_DECODE_PAYLOAD_WRITE_TIMEOUT_S
-do
-  export "${raiden_io_timeout}=${!raiden_io_timeout:-60}"
-done
+export SGLANG_DISAGG_PREFIX_VICTIM_PUSH=1
+export SGLANG_DISAGG_PREFILL_PULL_DECODE_PREFIX=1
 ```
 
-Choose the I/O budget for the expected payload and network. These settings bound
-individual stalled I/O calls, not the total duration of a transfer that keeps
-making slow progress. Memory remains reserved until native terminal completion;
-neither the session clock nor the I/O clock alone permits reusing live pages.
-Pausing generation does not revoke native reads; invoke memory-release APIs
-only after all native ownership has drained and the scheduler is fully idle.
+Both switches default to off. For hybrid SWA models, also set:
 
-The transport requires matching Python and native tpu-sync artifacts from the
-`ram2ram` API in
-[`759530c7fb0a5f7c38114187e1bcde745f709f24`](https://github.com/alisachen-google/h2h/commit/759530c7fb0a5f7c38114187e1bcde745f709f24).
-Both SGLang roles must use the same victim-protocol revision. An existing
-tpu-sync build of the pinned revision needs no patch. For a source build, follow
-the pinned fork's
-[build instructions](https://github.com/alisachen-google/h2h/blob/759530c7fb0a5f7c38114187e1bcde745f709f24/README.md#option-2-building-from-source)
-with `./build.sh torch` in an environment matching the installed `torch_tpu`
-ABI. Select that checkout on both roles:
+- Prefill: `SGLANG_TPU_ENABLE_PD_PREFILL_SWA_PATH_END_BACKUP=1`.
+- Decode: `SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS=128` (example window budget;
+  default `0`; size it for the available host memory).
 
-```bash
-export TPU_SYNC_SRC=/path/to/tpu-sync
-export PYTHONPATH="$TPU_SYNC_SRC${PYTHONPATH:+:$PYTHONPATH}"
-python - <<'PY'
-import inspect
-from tpu_sync.api.torch import kv_cache_manager as k
-print(k.__file__)
-assert "source" in inspect.signature(k.KVCacheManager.register_read).parameters
-assert "destination" in inspect.signature(k.KVCacheManager.start_read).parameters
-assert "local_host_block_ids" in inspect.signature(k.KVCacheManager.start_read).parameters
-PY
-```
+Use matching P/D TP/CP geometry and page layouts, PP=1, the Python unified
+radix tree, persistent HiCache host pools, and no GDN/Mamba or L3 storage.
+Hybrid models require page size >1. Multiple Decode engines need session affinity.
+Both engines need matching tpu-sync Python/native builds supporting
+`register_read(source="host")` and `start_read(destination="host")`.
 
-The signature check confirms the selected Python API; the native extension must
-also come from that build. Each victim-enabled host-pool manager opens a
-positive control port: this revision's Python constructor treats port zero as
-cache-only. Offers publish the producer's reachable control endpoint, rather
-than its block-data endpoint.
-
-FULL pages and the page-aligned trailing SWA window move through their respective
-host pools under one producer-owned UUID. A session is inserted only when every
-rank has received both copies and has the producer's successful completion
-notice. Failed transfers release both landing allocations after accepted native
-reads settle; shared-prefix insertions release duplicate FULL and SWA pages
-independently. This path has CPU unit coverage but has not been validated with
-model inference on TPU.
+Pages stay reserved until native completion; cache reset and memory release
+must wait for transfers to drain. Configure finite native socket I/O timeouts
+on both engines alongside `SGLANG_RAIDEN_CHUNK_TRANSFER_TIMEOUT_S`: session
+expiry alone does not interrupt blocked TCP I/O. This feature has CPU coverage;
+live TPU inference validation remains pending.
