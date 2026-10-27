@@ -212,6 +212,15 @@ class _Push(msgspec.Struct):
     transfers: List[Tuple[Any, str]] = []
 
 
+def _component_uuid(uuid: int, component: str) -> int:
+    """The native uuid of a victim's component read. With one shared raiden
+    host pool (the unified KV pool) the FULL and SWA reads register on the
+    same manager, which rejects a second registration under one uuid."""
+    if component == "full":
+        return uuid
+    return max(1, (uuid ^ (1 << 62)) % ((1 << 63) - 1))
+
+
 def _transfer_id(prefill: str, seq: int, component: str) -> str:
     return f"victim:{prefill}:{seq}:{component}"
 
@@ -368,7 +377,9 @@ class PrefillPusher:
                 req_id = _transfer_id(self._mgr.victim_namespace, push.seq, component)
                 # False can mean an early pull already completed. The native
                 # terminal report, rather than the return value, releases pins.
-                pool.transfer.register_read(req_id, push.uuid, pages, source="host")
+                pool.transfer.register_read(
+                    req_id, _component_uuid(push.uuid, component), pages, source="host"
+                )
                 push.transfers.append((pool.transfer, req_id))
             return True
         except Exception as exc:  # noqa: BLE001 - drain accepted registrations
@@ -719,7 +730,7 @@ class DecodeReceiver:
                 req_id = _transfer_id(push.prefill, push.seq, component)
                 pool.transfer.start_read(
                     req_id,
-                    push.uuid,
+                    _component_uuid(push.uuid, component),
                     address,
                     list(blocks),
                     None,
