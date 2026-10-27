@@ -987,14 +987,22 @@ def _is_fully_idle(
 
 def _evict_device_leaf(upstream: Callable, cache: Any, node_id: Any, tracker: Any):
     """Wraps ``UnifiedRadixCache._evict_device_leaf``: skip a leaf the walk
-    already deleted. Reclaiming a host copy for a recall landing leaves a
+    already deleted, and an unbacked leaf whose deletion would orphan a
+    host-only child (a host copy reclaimed for a recall landing). Reclaiming a host copy for a recall landing leaves a
     device leaf without a backup, which write-through eviction deletes
     outright; the FULL walk can then yield that leaf a second time (once
     from its start-of-walk snapshot, once as the parent of a leaf it took
     after), and the second visit raised KeyError and ended the scheduler."""
     try:
-        cache.tree_core.node_by_id(node_id)
+        node = cache.tree_core.node_by_id(node_id)
     except KeyError:
+        return None
+    if not node.backuped and any(
+        child.component_data[ComponentType.FULL].value is None
+        for child in node.children.values()
+    ):
+        # Write-through eviction would delete this unbacked node and orphan
+        # its host-only child; keep it on the device until that child is gone.
         return None
     return upstream(cache, node_id, tracker)
 

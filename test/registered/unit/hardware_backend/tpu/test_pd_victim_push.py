@@ -953,6 +953,14 @@ class TestRecallLandingReclaimsHostDuplicates(CustomTestCase):
         # The device copy is untouched: the prompt still hits in HBM.
         self.assertEqual(device_hit(cache, tokens), 16)
 
+    def test_a_duplicate_whose_children_are_on_device_is_taken(self):
+        cache, host, tokens = self._write_through_cache()
+        _, allocator = cache, cache.token_to_kv_pool_allocator
+        insert_tokens(cache, allocator, tokens + [8] * 8)  # a device child
+        self.assertGreaterEqual(
+            pd_host_prefix_recall.reclaim_full_host_duplicates(cache, 8), 8
+        )
+
     def test_a_duplicate_with_a_host_only_child_is_left_alone(self):
         # Deleting its device leaf later would orphan the subtree below it.
         cache, host, tokens = self._write_through_cache()
@@ -994,6 +1002,25 @@ class TestEvictionWalkSkipsDeletedLeaves(CustomTestCase):
         upstream.assert_called_once_with(cache, node.id, {})
         upstream.reset_mock()
         self.assertIsNone(victim_push._evict_device_leaf(upstream, cache, 10**9, {}))
+        upstream.assert_not_called()
+
+    def test_unbacked_parent_of_a_host_only_child_stays_on_device(self):
+        cache, allocator = full_cache(kv_size=32, host_capacity=32)
+        tokens = list(range(100, 108))
+        insert_tokens(cache, allocator, tokens)
+        node = root_node(cache, 100)
+        host = cache.cache_controller.host
+        from array import array as _array
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey as _RadixKey
+        from sglang_tpu.pd_host_cache import insert_host_prefix
+
+        insert_host_prefix(
+            cache, _RadixKey(_array("q", tokens + [7] * 8)), host.alloc(8), None, 1
+        )
+        self.assertFalse(node.backuped)
+        upstream = MagicMock(return_value="evicted")
+        self.assertIsNone(victim_push._evict_device_leaf(upstream, cache, node.id, {}))
         upstream.assert_not_called()
 
     def test_walk_is_wrapped(self):
