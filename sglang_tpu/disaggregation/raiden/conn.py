@@ -1158,8 +1158,8 @@ class RaidenKVManager(
         sliding-window pool (paged) has its own engine up, and a radix cache
         is kept."""
         return (
-            self.prefix_pull_enabled
-            and self._kv_caches is not None
+            getattr(self, "prefix_pull_enabled", False)
+            and getattr(self, "_kv_caches", None) is not None
             and not self._state_kv_caches
             and (
                 not self._swa_kv_caches

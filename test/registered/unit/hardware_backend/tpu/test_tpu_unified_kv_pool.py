@@ -1818,6 +1818,9 @@ class _PullReqBeforeSwaLayout(WireMessage):
     decode_port: int
     decode_pages: int
     decode_swa_pages: int = 0
+    # The decode-held prefix pull's fields: every prefill on this branch has them.
+    prefix_tokens: int = 0
+    prefix_offer: bool = False
 
 
 class TestUnifiedPoolPDTransfer(CustomTestCase):
