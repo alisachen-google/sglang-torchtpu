@@ -51,3 +51,14 @@ defaults for one environment; override them with the variables noted below.
 push, receive, flush and recall-landing paths; `test_pd_victim_lockstep.py`
 runs the puller on several ranks with a lockstep harness that reports any
 rank skipping or disagreeing on a collective.
+
+## Robustness cases (added 2026-10-27)
+
+| Script / recipe | Purpose |
+|---|---|
+| `decode_kill_case.sh` | kill the decode while recalls are in flight, restart it alone (`pd_e18f_vw.sh start-decode`), recall again; the prefill must survive |
+| `prefill_kill_case.sh` | kill the prefill while the decode holds offloaded KV, restart it alone (`start-prefill`), recall again; the decode must survive and offers to the new prefill must be clean |
+| `crc_compare_p1.py <run>` | join the `[victim-crc]` / `[recall-crc]` lines of a run made with `recipes/gpt-oss/gpt-oss_C_victim_crc.json` (`SGLANG_TPU_DEBUG_VICTIM_CRC=1`, a diagnostic build) into per-rank byte-level equality counts |
+| `recipes/gpt-oss/gpt-oss_C_victim_tipcheck.json` | the switch-only recipe with `SGLANG_ENABLE_RANK_CONSENSUS_CHECKER=1` (rank divergence ends the process) |
+| `recipes/gpt-oss/gpt-oss_C_victim_tiphostpress.json` | prefill `--hicache-ratio 0.5`: host pool of about three 128k documents |
+| `recipes/gpt-oss/gpt-oss_C_victim_unified.json` | `--enable-unified-memory` on both roles (for the `pd-victim-unified-pool` branch) |

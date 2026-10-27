@@ -27,6 +27,15 @@ start) recipe=${2:?}; run=${3:?}
   wait_url "http://$PREFILL_IP:$SERVER_PORT/health" 5400 "prefill /health"
   wait_url "http://$DECODE_IP:$SERVER_PORT/health" 5400 "decode /health"
   wait_url "http://$PREFILL_IP:$LB_PORT/health" 900 "LB /health" ;;
+start-prefill) recipe=${2:?}; run=${3:?}
+  log "prefill only on $PREFILL_IP"; spawn "$PREFILL_IP" prefill "$recipe" "$run"
+  wait_url "http://$PREFILL_IP:$SERVER_PORT/health" 5400 "prefill /health"
+  wait_url "http://$PREFILL_IP:$LB_PORT/health" 900 "LB /health" ;;
+stop-prefill) log "stopping ours on $PREFILL_IP"; run_on "$PREFILL_IP" "bash /home/$ME/pd_disagg/scripts/cleanup.sh" ;;
+start-decode) recipe=${2:?}; run=${3:?}
+  log "decode only on $DECODE_IP"; spawn "$DECODE_IP" decode "$recipe" "$run"
+  wait_url "http://$DECODE_IP:$SERVER_PORT/health" 5400 "decode /health" ;;
+stop-decode) log "stopping ours on $DECODE_IP"; run_on "$DECODE_IP" "bash /home/$ME/pd_disagg/scripts/cleanup.sh" ;;
 stop) for ip in $PREFILL_IP $DECODE_IP; do log "stopping ours on $ip"; run_on "$ip" "bash /home/$ME/pd_disagg/scripts/cleanup.sh"; done ;;
 status) for ip in $PREFILL_IP $DECODE_IP; do echo "== $ip"; run_on "$ip" "pgrep -u $ME -af 'launch_server|launch_router' | cut -c1-120 | head -3; echo sched=\$(pgrep -u $ME -fc 'sglang::scheduler'); free -g | sed -n 2p"; done
   for u in "http://$PREFILL_IP:$SERVER_PORT" "http://$DECODE_IP:$SERVER_PORT" "http://$PREFILL_IP:$LB_PORT"; do printf '%s health=%s\n' "$u" "$(curl -s -m 5 -o /dev/null -w '%{http_code}' $u/health)"; done ;;
