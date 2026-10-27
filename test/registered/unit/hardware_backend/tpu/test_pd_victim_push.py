@@ -119,6 +119,7 @@ class _FakeHostPool:
     def __init__(self, capacity: int, page_size=1):
         self.page_size = page_size
         self.capacity = capacity
+        self.size = capacity
         self.used = 0
         self.transfer = _FakeHostTransfer()
 

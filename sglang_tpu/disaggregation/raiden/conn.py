@@ -188,6 +188,10 @@ class RaidenKVManager(
 
         self._engine: Optional[Any] = None  # raiden KVCacheManager
         self._swa_engine: Optional[Any] = None
+        # Existing HiCache wrappers own the persistent DRAM buffers. These
+        # registrations survive room cleanup until native I/O has drained.
+        self._prefix_host_pools: Tuple[Any, Any] = (None, None)
+        self._prefix_host_reads: Dict[str, Any] = {}
         self._kv_caches: Optional[list] = None
         self._swa_kv_caches: Optional[list] = None
         self.raiden_endpoint: Optional[str] = None
@@ -520,6 +524,77 @@ class RaidenKVManager(
         )
         return endpoint, engine
 
+    def bind_prefix_host_pools(self, full: Any, swa: Any = None) -> None:
+        """Use the existing HiCache buffers for host-backed prefix recall."""
+        with self._state_lock:
+            self._prefix_host_pools = (full, swa)
+
+    def _host_prefix_pending_locked(self, room: int) -> bool:
+        return any(
+            self._is_room_transfer(rid, room)
+            for rid in getattr(self, "_prefix_host_reads", {})
+        )
+
+    def host_prefix_pending(self, room: int) -> bool:
+        with self._state_lock:
+            return self._host_prefix_pending_locked(room)
+
+    def start_host_prefix_read(
+        self,
+        req_id: str,
+        uuid: int,
+        endpoint: str,
+        remote: List[int],
+        local: List[int],
+        *,
+        swa: bool = False,
+    ) -> None:
+        """Track a HiCache receive independently of device staging admission."""
+        with self._state_lock:
+            room = self._room_of(req_id)
+            if room in self._aborted:
+                raise RuntimeError("Cannot start a host prefix read after abort")
+            pool = self._prefix_host_pools[int(swa)]
+            if pool is None:
+                raise RuntimeError("Host prefix recall requires a HiCache pool")
+            pool.transfer.start_read(
+                req_id,
+                uuid,
+                endpoint,
+                remote,
+                None,
+                local_host_block_ids=local,
+                destination="host",
+            )
+            self._prefix_host_reads[req_id] = pool.transfer
+
+    def _drain_prefix_host_reads(self) -> None:
+        # HiCache's wrapper is the sole native-report owner; it caches reports
+        # for victim exports and recall alike. Never poll its manager directly.
+        with self._state_lock:
+            if not getattr(self, "_prefix_host_reads", {}):
+                return
+            for req_id, transfer in list(
+                getattr(self, "_prefix_host_reads", {}).items()
+            ):
+                try:
+                    status = transfer.poll_transfer(req_id)
+                except Exception as exc:
+                    logger.warning("Cannot poll host prefix read %s: %s", req_id, exc)
+                    continue
+                if status is None:
+                    continue
+                if status == "sent":
+                    self._completed_send.add(req_id)
+                elif status == "received":
+                    self._completed_recv.add(req_id)
+                else:
+                    self._native_failed.add(req_id)
+                transfer.forget_transfer(req_id)
+                del self._prefix_host_reads[req_id]
+                self._superseded_sender_reads.discard(req_id)
+            self._settle_sender_reads_locked()
+
     def _staging_cost(self, pages: int, max_blocks: int) -> int:
         """Host pages a read of ``pages`` pages takes from its engine's pool.
 
@@ -701,6 +776,7 @@ class RaidenKVManager(
         return start, tail
 
     def _drain_engine(self) -> None:
+        self._drain_prefix_host_reads()
         if self._pipeline is not None:
             sent, received, failed = self._pipeline.poll()
             with self._state_lock:
@@ -1282,6 +1358,8 @@ class RaidenKVManager(
         if self._pipeline is not None:
             return self._pipeline.active(room)
         with self._state_lock:
+            if self._host_prefix_pending_locked(room):
+                return True
             # A decode serving its prefix pages to the prefill holds a read
             # lease on them like a prefill does on a chunk.
             if self._send_reads.get(room):
@@ -1323,6 +1401,9 @@ class RaidenKVManager(
             # still delivering keeps its receiver plan, each with the
             # completion that will settle it, until the engine reports it.
             held: Set[str] = set()
+            held.update(
+                k for k in getattr(self, "_prefix_host_reads", {}) if belongs(k)
+            )
             if self._pulling is not None:
                 for key in self._pulling.rooms():
                     if not belongs(key):
@@ -1393,6 +1474,8 @@ class RaidenKVManager(
                     self._prefill.reshard_pushed,
                     self._prefill.prefix_offer_taken,
                     self._prefill.prefix_resolved,
+                    self._prefill.prefix_host_offers,
+                    self._prefill.prefix_host_ready,
                 ):
                     table.discard(room)
             if self._decode is not None:
@@ -1428,6 +1511,7 @@ class RaidenKVManager(
                     self._decode.final_seen,
                     self._decode.reshard_registered,
                     self._decode.prefix_offer_pending,
+                    self._decode.prefix_host_offers,
                 ):
                     table.discard(room)
             if clear_failure_record:
