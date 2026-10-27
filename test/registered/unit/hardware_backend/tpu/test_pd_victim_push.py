@@ -961,6 +961,29 @@ class TestRecallLandingReclaimsHostDuplicates(CustomTestCase):
             pd_host_prefix_recall.reclaim_full_host_duplicates(cache, 8), 8
         )
 
+    def test_a_duplicate_below_another_duplicate_is_taken_tip_first(self):
+        # Write-through host prefixes stay closed under ancestors: the child's
+        # copy goes first, the parent's only once no child has a host copy.
+        cache, host, tokens = self._write_through_cache()
+        _, allocator = cache, cache.token_to_kv_pool_allocator
+        host.capacity += 8
+        child_tokens = tokens + [8] * 8
+        insert_tokens(cache, allocator, child_tokens)
+        child = root_node(cache, 100).children[
+            next(iter(root_node(cache, 100).children))
+        ]
+        cache.tree_core.commit_backup(child.id, host.alloc(len(child.key)), {})
+        cache.tree_core._update_duplicate_tracking(child)
+        self.assertEqual(host.available_size(), 0)
+        freed = pd_host_prefix_recall.reclaim_full_host_duplicates(cache, 8)
+        self.assertEqual(freed, 8)  # the child's copy, not the parent's
+        parent = root_node(cache, 100)
+        self.assertTrue(parent.backuped)
+        self.assertFalse(child.backuped)
+        self.assertEqual(
+            pd_host_prefix_recall.reclaim_full_host_duplicates(cache, 16), 16
+        )  # now the parent is a host tip and goes too
+
     def test_a_duplicate_with_a_host_only_child_is_left_alone(self):
         # Deleting its device leaf later would orphan the subtree below it.
         cache, host, tokens = self._write_through_cache()
