@@ -39,22 +39,37 @@ logger = logging.getLogger(__name__)
 
 
 def reclaim_full_host_duplicates(cache: Any, num_tokens: int) -> int:
-    """Free FULL host copies of pages the device still holds, oldest first.
+    """Free FULL host copies of childless pages the device still holds, least
+    recently used first.
 
     Host eviction only takes host-only leaves. Under write-through the
     prefill's RAM fills with copies of pages that are still in HBM, so a
     recall from decode RAM finds no room to land. Core reclaims such
     duplicates only under write-back; here a landing is worth more than a
     copy the device still holds, and the copy is rewritten on its next demote.
-    Returns the number of tokens freed (0 on a tree core without the walk).
+    A reclaimed node loses its backup, so write-through eviction later deletes
+    it instead of demoting it; only childless nodes are taken so that deletion
+    never orphans a host-only subtree below them. Returns the tokens freed
+    (0 on a tree core without the duplicate walk).
     """
-    reclaim = getattr(cache.tree_core, "_reclaim_full_host_duplicates", None)
-    if reclaim is None or num_tokens <= 0:
+    core = cache.tree_core
+    release = getattr(core, "_release_full_host_duplicate", None)
+    duplicates = getattr(core, "full_host_duplicates", None)
+    if release is None or duplicates is None or num_tokens <= 0:
         return 0
     tracker: dict = defaultdict(int)
     device_frees: dict = defaultdict(list)
     host_frees: dict = defaultdict(list)
-    reclaim(num_tokens, tracker, device_frees, host_frees)
+    taken = []
+    for node in sorted(duplicates.values(), key=lambda n: n.last_access_time):
+        if tracker[ComponentType.FULL] >= num_tokens:
+            break
+        if node.children or not core._can_reclaim_full_host_duplicate(node):
+            continue
+        release(node, tracker, device_frees, host_frees)
+        taken.append(node.id)
+    for node_id in taken:
+        duplicates.pop(node_id, None)
     cache._free_values(device_frees, host_frees)
     return int(tracker.get(ComponentType.FULL, 0))
 

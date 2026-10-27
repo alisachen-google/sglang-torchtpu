@@ -953,6 +953,22 @@ class TestRecallLandingReclaimsHostDuplicates(CustomTestCase):
         # The device copy is untouched: the prompt still hits in HBM.
         self.assertEqual(device_hit(cache, tokens), 16)
 
+    def test_a_duplicate_with_a_host_only_child_is_left_alone(self):
+        # Deleting its device leaf later would orphan the subtree below it.
+        cache, host, tokens = self._write_through_cache()
+        from array import array as _array
+
+        from sglang.srt.mem_cache.radix_cache import RadixKey as _RadixKey
+        from sglang_tpu.pd_host_cache import insert_host_prefix
+
+        host.capacity += 8
+        insert_host_prefix(
+            cache, _RadixKey(_array("q", tokens + [7] * 8)), host.alloc(8), None, 1
+        )
+        self.assertEqual(
+            pd_host_prefix_recall.reclaim_full_host_duplicates(cache, 8), 0
+        )
+
     def test_reclaim_is_a_no_op_without_pressure_or_the_walk(self):
         cache, host, _ = self._write_through_cache()
         self.assertEqual(
@@ -961,3 +977,27 @@ class TestRecallLandingReclaimsHostDuplicates(CustomTestCase):
         self.assertEqual(host.available_size(), 0)
         bare = SimpleNamespace(tree_core=SimpleNamespace())
         self.assertEqual(pd_host_prefix_recall.reclaim_full_host_duplicates(bare, 8), 0)
+
+
+class TestEvictionWalkSkipsDeletedLeaves(CustomTestCase):
+    """A leaf the eviction walk deleted earlier in the same walk may be
+    yielded again; the wrapper skips it instead of raising KeyError."""
+
+    def test_missing_leaf_is_skipped_and_present_leaf_is_evicted(self):
+        cache, allocator = full_cache(kv_size=32, host_capacity=32)
+        insert_tokens(cache, allocator, list(range(100, 108)))
+        node = root_node(cache, 100)
+        upstream = MagicMock(return_value="evicted")
+        self.assertEqual(
+            victim_push._evict_device_leaf(upstream, cache, node.id, {}), "evicted"
+        )
+        upstream.assert_called_once_with(cache, node.id, {})
+        upstream.reset_mock()
+        self.assertIsNone(victim_push._evict_device_leaf(upstream, cache, 10**9, {}))
+        upstream.assert_not_called()
+
+    def test_walk_is_wrapped(self):
+        self.assertIn(
+            (UnifiedRadixCache, "_evict_device_leaf", victim_push._evict_device_leaf),
+            victim_push._patch_targets(),
+        )

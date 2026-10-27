@@ -985,6 +985,20 @@ def _is_fully_idle(
     return idle
 
 
+def _evict_device_leaf(upstream: Callable, cache: Any, node_id: Any, tracker: Any):
+    """Wraps ``UnifiedRadixCache._evict_device_leaf``: skip a leaf the walk
+    already deleted. Reclaiming a host copy for a recall landing leaves a
+    device leaf without a backup, which write-through eviction deletes
+    outright; the FULL walk can then yield that leaf a second time (once
+    from its start-of-walk snapshot, once as the parent of a leaf it took
+    after), and the second visit raised KeyError and ended the scheduler."""
+    try:
+        cache.tree_core.node_by_id(node_id)
+    except KeyError:
+        return None
+    return upstream(cache, node_id, tracker)
+
+
 def _checkpoint(upstream, cache, req, **kwargs):
     result = upstream(cache, req, **kwargs)
     ref = _pushers_by_cache.get(cache)
@@ -1019,6 +1033,7 @@ def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
     return (
         (UnifiedRadixCache, "reset", _reset_cache),
         (UnifiedRadixCache, "checkpoint", _checkpoint),
+        (UnifiedRadixCache, "_evict_device_leaf", _evict_device_leaf),
         (DecodePreallocQueue, "add", _decode_add),
         (Scheduler, "is_fully_idle", _is_fully_idle),
         (DecodeTransferQueue, "resolve_deferred_releases", _resolve_deferred_releases),
