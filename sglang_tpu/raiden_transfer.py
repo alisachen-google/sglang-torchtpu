@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, List, Literal
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.network import get_free_port
-from sglang_tpu.envs import envs as tpu_envs
+from sglang_tpu import pd_spill_flags
 from sglang_tpu.tpu_dma_hicache import NOOP_EVENT
 
 if TYPE_CHECKING:
@@ -134,7 +134,7 @@ class RaidenKVTransfer:
         # transfers need a positive control port on the existing HiCache pool;
         # allocating another manager would serve different host memory.
         self._host_control_port = (
-            get_free_port() if tpu_envs.SGLANG_DISAGG_PREFIX_VICTIM_PUSH.get() else 0
+            get_free_port() if pd_spill_flags.victim_push_enabled() else 0
         )
         self._host_transfers: dict[str, HostTransferStatus | None] = {}
         self._mgr = KVCacheManager(
