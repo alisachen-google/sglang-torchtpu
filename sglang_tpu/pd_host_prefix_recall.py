@@ -48,9 +48,12 @@ def reclaim_full_host_duplicates(cache: Any, num_tokens: int) -> int:
     duplicates only under write-back; here a landing is worth more than a
     copy the device still holds, and the copy is rewritten on its next demote.
     A reclaimed node loses its backup, so write-through eviction later deletes
-    it instead of demoting it; only childless nodes are taken so that deletion
-    never orphans a host-only subtree below them. Returns the tokens freed
-    (0 on a tree core without the duplicate walk).
+    it instead of demoting it, and write-through host prefixes must stay closed
+    under ancestors. A node is therefore taken only while every child of it is
+    device-only (chains are taken tip first), and the eviction wrapper in
+    pd_victim_push keeps such a node on the device for as long as a child of
+    it is host-only, so a deletion never orphans a host-only subtree. Returns
+    the tokens freed (0 on a tree core without the duplicate walk).
     """
     core = cache.tree_core
     release = getattr(core, "_release_full_host_duplicate", None)
@@ -64,7 +67,17 @@ def reclaim_full_host_duplicates(cache: Any, num_tokens: int) -> int:
     for node in sorted(duplicates.values(), key=lambda n: n.last_access_time):
         if tracker[ComponentType.FULL] >= num_tokens:
             break
-        if node.children or not core._can_reclaim_full_host_duplicate(node):
+        if not core._can_reclaim_full_host_duplicate(node) or any(
+            child.component_data[ComponentType.FULL].value is None
+            or child.component_data[ComponentType.FULL].host_value is not None
+            for child in node.children.values()
+        ):
+            # Only a node whose children are all device-only: a child without
+            # a device copy would be orphaned if this node, unbacked from now
+            # on, were deleted by write-through eviction, and a child with a
+            # host copy would sit below a host tombstone, which the next host
+            # insert on this path rejects (write-through host prefixes are
+            # closed under ancestors). Chains are thus taken tip first.
             continue
         release(node, tracker, device_frees, host_frees)
         taken.append(node.id)
