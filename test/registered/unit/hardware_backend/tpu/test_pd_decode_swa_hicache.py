@@ -565,7 +565,7 @@ class TestFullOnlyStrategy(CustomTestCase):
         host_pools = {"full": MagicMock(), "swa": MagicMock()}
         with (
             installed_patches(),
-            tpu_envs.SGLANG_TPU_PD_DECODE_SWA_HOST_WINDOWS.override(num_windows),
+            tpu_envs.SGLANG_TPU_PD_SWA_HOST_WINDOWS.override(num_windows),
             patch(TPU + ".get_memory", return_value=memory()),
             patch(
                 ASSEMBLER + ".build_kv_host_pool",
