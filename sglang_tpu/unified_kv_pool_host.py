@@ -97,6 +97,14 @@ class TpuRaidenUnifiedHostKVCache(TpuRaidenHostKVCache):
             )
             self._pages_per_id = num_extra + 1
 
+    @property
+    def transfer(self):
+        """The shared pool's raiden transfer: host-to-host reads (the decode-DRAM
+        offload's victim pushes and recalls) register and land shared-pool page
+        ids on it, which is what this facade's ``_to_page_ids`` yields for a
+        pool whose sliding-window layers form one group."""
+        return self._shared.transfer
+
     def clear(self) -> None:
         # Resets the page list both kinds share, so clearing both facades
         # resets it twice to the same state.
