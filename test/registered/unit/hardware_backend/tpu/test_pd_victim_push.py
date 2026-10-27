@@ -16,7 +16,9 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.cache_controller import HiCacheAck
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -33,6 +35,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang_tpu import pd_host_prefix_recall
 from sglang_tpu import pd_victim_push as victim_push
 from sglang_tpu.disaggregation.raiden.serde import VictimAck, VictimDone, VictimPush
 from sglang_tpu.raiden_hybrid_cache_controller import TpuRaidenHybridCacheController
@@ -877,3 +880,84 @@ class TestHybridVictims(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDecodeFlushWaitsForDeferredReleases(CustomTestCase):
+    """A decode cache reset must wait for pages the transfer queue still owns."""
+
+    def _scheduler(self, *, deferred: bool, mode=DisaggregationMode.DECODE):
+        queue = SimpleNamespace(has_pending_deferred_releases=lambda: deferred)
+        return SimpleNamespace(
+            disaggregation_mode=mode, disagg_decode_transfer_queue=queue
+        )
+
+    def test_pinned_offers_keep_the_decode_non_idle_for_a_flush(self):
+        upstream = MagicMock(return_value=True)
+        scheduler = self._scheduler(deferred=True)
+        self.assertFalse(victim_push._is_fully_idle(upstream, scheduler))
+        # Health checks only ask about running work, as upstream does.
+        self.assertTrue(
+            victim_push._is_fully_idle(upstream, scheduler, for_health_check=True)
+        )
+        upstream.assert_called_with(
+            scheduler, for_health_check=True, ignore_waiting=False
+        )
+
+    def test_released_pages_and_other_roles_defer_to_upstream(self):
+        upstream = MagicMock(return_value=True)
+        self.assertTrue(
+            victim_push._is_fully_idle(upstream, self._scheduler(deferred=False))
+        )
+        self.assertTrue(
+            victim_push._is_fully_idle(
+                upstream,
+                self._scheduler(deferred=True, mode=DisaggregationMode.PREFILL),
+            )
+        )
+        upstream.return_value = False
+        self.assertFalse(
+            victim_push._is_fully_idle(upstream, self._scheduler(deferred=False))
+        )
+
+    def test_scheduler_idle_check_is_wrapped(self):
+        self.assertIn(
+            (Scheduler, "is_fully_idle", victim_push._is_fully_idle),
+            victim_push._patch_targets(),
+        )
+
+
+class TestRecallLandingReclaimsHostDuplicates(CustomTestCase):
+    """A recall lands in the prefill's RAM; under write-through that RAM is
+    full of copies of pages the device still holds, which host eviction
+    never takes. The puller reclaims those copies for the landing."""
+
+    def _write_through_cache(self):
+        cache, allocator = full_cache(kv_size=64, host_capacity=16)
+        cache.tree_core.is_write_back = cache.is_write_back = False
+        tokens = list(range(100, 116))
+        insert_tokens(cache, allocator, tokens)
+        node = root_node(cache, 100)
+        host = cache.cache_controller.host
+        cache.tree_core.commit_backup(node.id, host.alloc(len(node.key)), {})
+        # The write-through ack registers the duplicate in production.
+        cache.tree_core._update_duplicate_tracking(node)
+        return cache, host, tokens
+
+    def test_host_only_eviction_frees_nothing_but_the_reclaim_does(self):
+        cache, host, tokens = self._write_through_cache()
+        self.assertEqual(host.available_size(), 0)
+        self.assertEqual(cache.evict_host(8, FULL), 0)
+        freed = pd_host_prefix_recall.reclaim_full_host_duplicates(cache, 8)
+        self.assertGreaterEqual(freed, 8)
+        self.assertGreaterEqual(host.available_size(), 8)
+        # The device copy is untouched: the prompt still hits in HBM.
+        self.assertEqual(device_hit(cache, tokens), 16)
+
+    def test_reclaim_is_a_no_op_without_pressure_or_the_walk(self):
+        cache, host, _ = self._write_through_cache()
+        self.assertEqual(
+            pd_host_prefix_recall.reclaim_full_host_duplicates(cache, 0), 0
+        )
+        self.assertEqual(host.available_size(), 0)
+        bare = SimpleNamespace(tree_core=SimpleNamespace())
+        self.assertEqual(pd_host_prefix_recall.reclaim_full_host_duplicates(bare, 8), 0)

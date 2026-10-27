@@ -49,6 +49,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -960,6 +961,30 @@ def _has_pending_deferred_releases(
     )
 
 
+def _is_fully_idle(
+    upstream: Callable,
+    scheduler: Any,
+    for_health_check: bool = False,
+    ignore_waiting: bool = False,
+) -> bool:
+    """Wraps ``Scheduler.is_fully_idle``: a decode that still owns offered or
+    landing prefix pages outside its tree is not idle for a cache flush. The
+    reset would otherwise pull those pages from under the prefill's read; the
+    flush is refused like any other pending work and retried by the caller."""
+    idle = upstream(
+        scheduler, for_health_check=for_health_check, ignore_waiting=ignore_waiting
+    )
+    if (
+        idle
+        and not for_health_check
+        and scheduler.disaggregation_mode == DisaggregationMode.DECODE
+    ):
+        queue = getattr(scheduler, "disagg_decode_transfer_queue", None)
+        if queue is not None and queue.has_pending_deferred_releases():
+            return False
+    return idle
+
+
 def _checkpoint(upstream, cache, req, **kwargs):
     result = upstream(cache, req, **kwargs)
     ref = _pushers_by_cache.get(cache)
@@ -988,10 +1013,14 @@ def _reset_cache(upstream, cache):
 
 
 def _patch_targets() -> tuple[tuple[Any, str, Callable], ...]:
+    # Imported here: the scheduler module is heavy and installs run early.
+    from sglang.srt.managers.scheduler import Scheduler
+
     return (
         (UnifiedRadixCache, "reset", _reset_cache),
         (UnifiedRadixCache, "checkpoint", _checkpoint),
         (DecodePreallocQueue, "add", _decode_add),
+        (Scheduler, "is_fully_idle", _is_fully_idle),
         (DecodeTransferQueue, "resolve_deferred_releases", _resolve_deferred_releases),
         (
             DecodeTransferQueue,

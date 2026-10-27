@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import time
 import weakref
+from collections import defaultdict
 from typing import Any, List, Optional, Sequence
 
 import torch
@@ -35,6 +36,27 @@ from sglang_tpu.pd_host_cache import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def reclaim_full_host_duplicates(cache: Any, num_tokens: int) -> int:
+    """Free FULL host copies of pages the device still holds, oldest first.
+
+    Host eviction only takes host-only leaves. Under write-through the
+    prefill's RAM fills with copies of pages that are still in HBM, so a
+    recall from decode RAM finds no room to land. Core reclaims such
+    duplicates only under write-back; here a landing is worth more than a
+    copy the device still holds, and the copy is rewritten on its next demote.
+    Returns the number of tokens freed (0 on a tree core without the walk).
+    """
+    reclaim = getattr(cache.tree_core, "_reclaim_full_host_duplicates", None)
+    if reclaim is None or num_tokens <= 0:
+        return 0
+    tracker: dict = defaultdict(int)
+    device_frees: dict = defaultdict(list)
+    host_frees: dict = defaultdict(list)
+    reclaim(num_tokens, tracker, device_frees, host_frees)
+    cache._free_values(device_frees, host_frees)
+    return int(tracker.get(ComponentType.FULL, 0))
 
 
 class HostPullPlan(PrefixPullPlan):
@@ -162,7 +184,9 @@ class HostPrefixPuller(DecodePrefixPuller):
                 [[max(0, tokens - pool.available_size())]], dist.ReduceOp.MAX
             )[0][0]
             if short:
-                self._tree_cache.evict_host(short, component)
+                freed = self._tree_cache.evict_host(short, component)
+                if freed < short and component == ComponentType.FULL:
+                    reclaim_full_host_duplicates(self._tree_cache, short - freed)
             allocated.append(pool.alloc(tokens))
         full, swa = allocated
         ok = self._all_ranks_reduce(
@@ -260,6 +284,18 @@ class HostPrefixPuller(DecodePrefixPuller):
             self.stats["pulls"] += 1
             self.stats["pulled_tokens"] += len(plan.new_indices)
             self.stats["dedup_tokens"] += max(0, result.prefix_len - have)
+        logger.info(
+            "[prefix-pull] room=%s pulled_tokens=%d have_tokens=%d swa_tokens=%d "
+            "inserted=%s wait_ms=%.0f read_ms=%.0f totals=%s",
+            req.bootstrap_room,
+            len(plan.new_indices),
+            have,
+            0 if plan.swa_indices is None else len(plan.swa_indices),
+            result.inserted_host_node is not None and not result.host_insert_dropped,
+            (plan.started_at - plan.asked_at) * 1e3,
+            (time.time() - plan.started_at) * 1e3,
+            self.stats,
+        )
         self._tree_cache.dec_host_lock_ref(plan.lock_node, plan.lock_receipt)
 
     def _pin(self, *, req: Any, plan: HostPullPlan, node: Any) -> None:
