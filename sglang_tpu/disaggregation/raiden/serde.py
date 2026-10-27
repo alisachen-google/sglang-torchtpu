@@ -80,6 +80,11 @@ class PullReq(WireMessage):
     # PREFIX_OFFER naming their pages follows once they are device-resident.
     prefix_tokens: int = 0
     prefix_offer: bool = False
+    # Set only by a decode on the TPU unified KV pool: (tensors its SWA engine
+    # registers, blocks per window page). Unset is left out of the payload, so
+    # other decodes keep the old message, and a prefill without the field
+    # rejects it rather than pairing mismatched block lists.
+    swa_layout: tuple[int, int] | msgspec.UnsetType = msgspec.UNSET
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
@@ -250,6 +255,8 @@ class ReshardReq(WireMessage):
     dst_attn_tp: int
     decode_swa_blocks: list[int]
     swa_push_endpoint: str
+    # See PullReq.swa_layout.
+    swa_layout: tuple[int, int] | msgspec.UnsetType = msgspec.UNSET
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
