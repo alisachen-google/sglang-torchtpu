@@ -5,10 +5,8 @@ Kept thin: every decision is in stage_prefill_workers.py, which runs without
 torch. A method named there as "from the tree alone" must read nothing that
 differs between stages at the same micro-batch slot.
 
-Simpler than the tensor-parallel workers in three places, each a follow-up:
-a recall reads the whole offered prefix even when the stage holds part of it;
-a stored branch is not made the next eviction victim; a pair with the switch
-on for one role only is not failed by name.
+Simpler than the tensor-parallel workers in one place, a follow-up:
+a pair with the switch on for one role only is not failed by name.
 """
 
 from __future__ import annotations
@@ -22,6 +20,7 @@ from array import array
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import msgspec
+import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -31,15 +30,19 @@ from sglang_tpu.disaggregation.decode_dram_offload.prefill_dram_victim_pusher im
     victim_transfer_id,
 )
 from sglang_tpu.disaggregation.decode_dram_offload.radix_host_ops import (
+    host_backed_prefix,
     host_page_ids,
     host_pages,
     insert_host_prefix,
     is_live_host_backed_leaf,
     leaf_of,
     lock_host_path,
+    mark_next_victim,
     offer_limit,
+    path_len,
     path_tokens,
     prefix_radix_key,
+    reclaim_full_host_duplicates,
     unlock_host_path,
     window_host_pages,
 )
@@ -53,6 +56,7 @@ from sglang_tpu.disaggregation.decode_dram_offload.stage_layout_store import (
 from sglang_tpu.disaggregation.decode_dram_offload.stage_pool_builder import (
     stage_pool_layout,
 )
+from sglang_tpu.envs import envs as tpu_envs
 
 logger = logging.getLogger(__name__)
 
@@ -209,8 +213,10 @@ class StagePushOps:
         self._namespace: Optional[str] = None
         # Leaf -> the decode ranks that served it: (ranks, {rank: endpoint}).
         self._routes = weakref.WeakKeyDictionary()
+        self._completed_leaves = weakref.WeakSet()
         self._pushed_len = weakref.WeakKeyDictionary()
         self._pushes: Dict[int, _PushState] = {}
+        self._victim_stamp = prefill_dram_victim_pusher._VICTIM_STAMP_BASE
 
     # ----- tracking, from the hooks ------------------------------------------------
 
@@ -238,27 +244,31 @@ class StagePushOps:
         node = leaf_of(self._ctx.cache, node_id)
         if node is not None and peers is not None:
             self._routes[node] = peers
+            tokens = path_len(self._ctx.cache, node)
+            if tokens >= offer_limit(req=req, page_size=self._ctx.page_size):
+                self._completed_leaves.add(node)
             if on_decode:
-                self._pushed_len[node] = len(path_tokens(self._ctx.cache, node))
+                self._pushed_len[node] = tokens
 
     def release_all(self) -> None:
         if self._pushes:
             raise RuntimeError("stage pushes are in flight; the engine is not idle")
         self._routes.clear()
+        self._completed_leaves.clear()
         self._pushed_len.clear()
 
     # ----- ops ---------------------------------------------------------------------
 
     def _under_host_pressure(self) -> bool:
         ctx = self._ctx
-        return (
-            ctx.host_pool.available_size()
-            < prefill_dram_victim_pusher._PUSH_FULL_FREE_TOKENS
-            or (
-                ctx.swa_host_pool is not None
-                and ctx.swa_host_pool.available_size()
-                < prefill_dram_victim_pusher._PUSH_SWA_FREE_WINDOWS * ctx.window_tokens
-            )
+        lead = (
+            tpu_envs.SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS.get()
+            or prefill_dram_victim_pusher._PUSH_FULL_FREE_TOKENS
+        )
+        return ctx.host_pool.available_size() < lead or (
+            ctx.swa_host_pool is not None
+            and ctx.swa_host_pool.available_size()
+            < prefill_dram_victim_pusher._PUSH_SWA_FREE_WINDOWS * ctx.window_tokens
         )
 
     def _pages_of(self, node: Any) -> Optional[Tuple[List[int], List[int], List[int]]]:
@@ -286,6 +296,7 @@ class StagePushOps:
         if not self._under_host_pressure():
             return None
         busy = {push.leaf for push in self._pushes.values()}
+        best_rank: Optional[Tuple[int, float, int]] = None
         coldest: List[Tuple[Any, List[int]]] = []
         for node, (ranks, endpoints) in list(self._routes.items()):
             pushable = is_live_host_backed_leaf(self._ctx.cache, node)
@@ -293,12 +304,17 @@ class StagePushOps:
                 self._routes.pop(node, None)
             if not pushable or node in busy or len(endpoints) < ranks:
                 continue
-            if coldest and node.last_access_time > coldest[0][0].last_access_time:
+            tier = 0 if node in self._completed_leaves else 1
+            if best_rank is not None and (tier, node.last_access_time) > best_rank[:2]:
                 continue
             held = self._pages_of(node)
             if held is None or self._pushed_len.get(node) == len(held[0]):
                 continue
-            if coldest and node.last_access_time < coldest[0][0].last_access_time:
+            rank = (tier, node.last_access_time, -len(held[0]))
+            if best_rank is not None and rank > best_rank:
+                continue
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
                 coldest = []
             coldest.append((node, held[0]))
         if not coldest:
@@ -413,12 +429,23 @@ class StagePushOps:
         channel.forget_host_reads(push.read_ids)
         channel.forget_victim(seq)
         unlock_host_path(self._ctx.cache, push.locks)
+        if stored:
+            try:
+                if self._ctx.cache.tree_core.node_by_id(push.leaf.id) is push.leaf:
+                    self._victim_stamp = mark_next_victim(
+                        self._ctx.cache, push.leaf.id, self._victim_stamp
+                    )
+            except KeyError:
+                pass
 
 
 class _Pull(msgspec.Struct):
     req: Any
     blocks: List[int]
     swa_blocks: List[int]
+    first_page: int = 0
+    reused_indices: Any = None
+    reuse_locks: List[Any] = msgspec.field(default_factory=list)
     indices: Any = None
     swa_indices: Any = None
     asked_at: float = 0.0
@@ -452,7 +479,14 @@ class StageRecallOps:
         self._pins: Dict[int, Tuple[Any, Any, Any]] = {}
         self.recalled: set = set()
         self.stats = dict.fromkeys(
-            ("adopted_backup_tokens", "no_memory", "refused", "ready_timeout"), 0
+            (
+                "adopted_backup_tokens",
+                "reused_local_pages",
+                "no_memory",
+                "refused",
+                "ready_timeout",
+            ),
+            0,
         )
 
     def max_inflight_pages(self) -> int:
@@ -501,18 +535,41 @@ class StageRecallOps:
         offered = self._offered.pop(room, None)
         if req is None or offered is None or len(offered[0]) != pages:
             return False
-        pull = _Pull(req=req, blocks=offered[0], swa_blocks=offered[1])
-        self._pulls[room] = pull
         page = ctx.page_size
+        key = prefix_radix_key(req=req, num_tokens=pages * page)
+        node, have, have_tensors = host_backed_prefix(
+            ctx.cache, key, pages * page, page
+        )
+        first_page = min(have // page, max(0, pages - 1)) if have > 0 else 0
+        reused_indices = None
+        reuse_locks: List[Any] = []
+        if first_page > 0:
+            cat_have = (
+                torch.cat(have_tensors) if len(have_tensors) > 1 else have_tensors[0]
+            )
+            reused_indices = cat_have[: first_page * page]
+            reuse_locks = lock_host_path(ctx.cache, node)
+        missing_pages = pages - first_page
+        pull = _Pull(
+            req=req,
+            blocks=offered[0],
+            swa_blocks=offered[1],
+            first_page=first_page,
+            reused_indices=reused_indices,
+            reuse_locks=reuse_locks,
+        )
+        self._pulls[room] = pull
         for pool, tokens, component in (
-            (ctx.host_pool, pages * page, ComponentType.FULL),
+            (ctx.host_pool, missing_pages * page, ComponentType.FULL),
             (ctx.swa_host_pool, len(pull.swa_blocks) * page, ComponentType.SWA),
         ):
             if not tokens:
                 continue
             short = max(0, tokens - pool.available_size())
             if short:
-                ctx.cache.evict_host(short, component)
+                freed = ctx.cache.evict_host(short, component)
+                if freed < short and component == ComponentType.FULL:
+                    reclaim_full_host_duplicates(ctx.cache, short - freed)
             indices = pool.alloc(tokens)
             if indices is None:
                 self.stats["no_memory"] += 1
@@ -522,7 +579,9 @@ class StageRecallOps:
             else:
                 pull.swa_indices = indices
         pull.asked_at = time.monotonic()
-        return ctx.channel.ask_stage_prefix_pull(room, 0, pages, stage=self._stage)
+        return ctx.channel.ask_stage_prefix_pull(
+            room, first_page, missing_pages, stage=self._stage
+        )
 
     def outcome(self, room: int) -> Optional[bool]:
         pull = self._pulls[room]
@@ -553,7 +612,7 @@ class StageRecallOps:
                 False,
                 ready.uuid,
                 ready.endpoint,
-                pull.blocks,
+                pull.blocks[pull.first_page :],
                 ctx.host_pool,
                 pull.indices,
             )
@@ -604,6 +663,9 @@ class StageRecallOps:
             self._ctx.host_pool.free(pull.indices)
         if pull.swa_indices is not None:
             self._ctx.swa_host_pool.free(pull.swa_indices)
+        if pull.reuse_locks:
+            unlock_host_path(self._ctx.cache, pull.reuse_locks)
+            pull.reuse_locks = []
 
     def commit(self, room: int) -> None:
         ctx = self._ctx
@@ -647,15 +709,26 @@ class StageRecallOps:
                     host_page_ids(ctx.swa_host_pool, pull.swa_indices),
                     "draft window",
                 )
+        full_indices = (
+            torch.cat([pull.reused_indices, pull.indices])
+            if pull.reused_indices is not None
+            else pull.indices
+        )
+        reused_tokens = pull.first_page * ctx.page_size
         node, _ = insert_host_prefix(
             ctx.cache,
             prefix_radix_key(req=pull.req, num_tokens=len(pull.blocks) * ctx.page_size),
-            pull.indices,
+            full_indices,
             ctx.page_size,
             swa_indices=pull.swa_indices,
+            reused_tokens=reused_tokens,
             stats=self.stats,
         )
+        if pull.reuse_locks:
+            unlock_host_path(ctx.cache, pull.reuse_locks)
+            pull.reuse_locks = []
         if node is not None:
+            self.stats["reused_local_pages"] += pull.first_page
             receipt = ctx.cache.inc_host_lock_ref(node).to_dec_params()
             self._pins[room] = (pull.req, node, receipt)
             self.recalled.add(room)

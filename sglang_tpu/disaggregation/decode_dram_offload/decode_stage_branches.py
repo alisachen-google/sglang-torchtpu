@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from sglang_tpu.disaggregation.decode_dram_offload.stage_layout_store import (
+    DEFAULT_PAGES_PER_WINDOW_PAGE,
     Landing,
     Match,
     StageLayoutStore,
@@ -121,10 +122,12 @@ class StagePoolSet:
         decode_ranks: int,
         budget_bytes: int,
         build_pool: Callable[[Any, int], Any],
+        pages_per_window_page: int = DEFAULT_PAGES_PER_WINDOW_PAGE,
     ) -> None:
         self.rank = rank
         self.decode_ranks = decode_ranks
         self._budget_bytes = budget_bytes
+        self._pages_per_window_page = pages_per_window_page
         # (layout of a part, pages) -> an object with RaidenKVTransfer's host
         # read methods, over host memory in that layout.
         self._build_pool = build_pool
@@ -184,6 +187,7 @@ class StagePoolSet:
             page_bytes=max(page_bytes, 1),
             window_page_bytes=swa_bytes,
             window_pages=window_pages if swa_bytes else 0,
+            pages_per_window_page=self._pages_per_window_page,
         )
         error = None
         if pages < 1 or (window_pages and windows < 1):
