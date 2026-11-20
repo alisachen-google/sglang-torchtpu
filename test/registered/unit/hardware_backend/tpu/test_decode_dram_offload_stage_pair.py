@@ -11,7 +11,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,6 +37,7 @@ from sglang_tpu.testing.decode_dram_offload import (
     insert_tokens,
     prefill_manager,
     pushed_req,
+    root_node,
 )
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -684,6 +685,345 @@ class TestPageByteCheck(CustomTestCase):
         check.record("s", [1, 2], pool, [0], "full")
         self.assertEqual(check.verify("s", [1, 2], pool, [0], "full"), 0)
         self.assertEqual(sum(check.stats.values()), 0)
+
+
+class TestHeadroomFixes(CustomTestCase):
+    """Tests for PP offload headroom fixes (b/588216260): completed-leaf priority,
+    evict-stored-first demotion, delta-slice stage recall, stage store branch
+    ratio env, and Muse Spark AgentX c=48/64 + override wiring."""
+
+    def test_completed_leaf_pushed_ahead_of_older_incomplete_chunk_leaf(self):
+        pair = _Pair(self)
+        chunk = list(range(200, 208))
+        full_prompt = chunk + list(range(208, 220))
+        completed_session = list(range(300, 316))
+
+        # Request 1 checkpoints only an incomplete 8-token mid-prefill chunk of a 20-token prompt.
+        for stage in pair.stages:
+            insert_tokens(stage.cache, stage.allocator, chunk)
+        reqs_chunk = pair.request(1, full_prompt)
+        for stage, req in zip(pair.stages, reqs_chunk):
+            key = RadixKey(array("q", chunk))
+            req.last_node = stage.cache.match_prefix(
+                MatchPrefixParams(key=key)
+            ).best_match_node
+        pair.decode_asks_for(1)
+        pair.ring_step(LAG + 2, ready={"rid-1"})
+
+        # Request 2 completes its full 16-token prompt later (warmer timestamp than chunk).
+        for stage in pair.stages:
+            insert_tokens(stage.cache, stage.allocator, completed_session)
+        pair.request(2, completed_session + [999])
+        pair.decode_asks_for(2)
+        pair.ring_step(LAG + 2, ready={"rid-2"})
+
+        for stage in pair.stages:
+            stage.cache.evict(EvictParams(num_tokens=24))
+            self.assertEqual(host_hit(stage.cache, chunk), 8)
+            self.assertEqual(host_hit(stage.cache, completed_session), 16)
+            stage.scheduler.waiting_queue.append("serving")
+
+        # Completed prompt-end leaf (16 tokens) must be pushed before the older 8-token chunk.
+        pair.ring_step(LAG + 2)
+        pair.decode_step()
+        pair.decode_transfers("received")
+        pair.stage_transfers("sent")
+        pair.decode_step()
+        pair.ring_step(LAG + 2)
+        self.assertTrue(
+            pair.decode.extension.landing.store.holds(
+                (None, None), completed_session, with_window=False
+            )
+        )
+        self.assertFalse(
+            pair.decode.extension.landing.store.holds(
+                (None, None), chunk, with_window=False
+            )
+        )
+
+    def test_stored_branch_is_evicted_from_prefill_host_before_unpushed_session(self):
+        pair = _Pair(self)
+        s_pushed = list(range(400, 412))
+        s_unpushed = list(range(500, 512))
+
+        # Insert unpushed session first (older original timestamp), without routing to decode.
+        for stage in pair.stages:
+            insert_tokens(stage.cache, stage.allocator, s_unpushed)
+            insert_tokens(stage.cache, stage.allocator, s_pushed)
+        pair.request(1, s_pushed + [999])
+        pair.decode_asks_for(1)
+        pair.ring_step(LAG + 2, ready={"rid-1"})
+
+        for stage in pair.stages:
+            stage.cache.evict(EvictParams(num_tokens=24))
+            stage.scheduler.waiting_queue.append("serving")
+
+        pair.ring_step(LAG + 2)
+        pair.decode_step()
+        pair.decode_transfers("received")
+        pair.stage_transfers("sent")
+        pair.decode_step()
+        pair.ring_step(LAG + 2)
+
+        # Once stored on decode, s_pushed is marked next victim on prefill, so evicting 12 host tokens
+        # reclaims s_pushed first and keeps unpushed s_unpushed alive in prefill host DRAM.
+        for stage in pair.stages:
+            self.assertEqual(stage.extension.workers.push.stats["stored"], 1)
+            stage.cache.evict_host(12, FULL)
+            self.assertEqual(host_hit(stage.cache, s_pushed), 0)
+            self.assertEqual(host_hit(stage.cache, s_unpushed), 12)
+
+    def test_delta_slice_recall_reads_only_missing_suffix_pages(self):
+        pair = _Pair(self)
+        full_branch = list(range(600, 616))
+        prefix_kept = full_branch[:10]
+
+        for stage in pair.stages:
+            insert_tokens(stage.cache, stage.allocator, full_branch)
+        pair.request(1, full_branch + [999])
+        pair.decode_asks_for(1)
+        pair.ring_step(LAG + 2, ready={"rid-1"})
+        for stage in pair.stages:
+            stage.cache.evict(EvictParams(num_tokens=16))
+            stage.scheduler.waiting_queue.append("serving")
+
+        pair.ring_step(LAG + 2)
+        pair.decode_step()
+        pair.decode_transfers("received")
+        pair.stage_transfers("sent")
+        pair.decode_step()
+        pair.ring_step(LAG + 2)
+
+        # Evict full_branch from prefill host, then re-populate only the first 10 tokens in host DRAM.
+        for stage in pair.stages:
+            stage.scheduler.waiting_queue.clear()
+            stage.cache.evict_host(16, FULL)
+            self.assertEqual(host_hit(stage.cache, full_branch), 0)
+            insert_tokens(stage.cache, stage.allocator, prefix_kept)
+            stage.cache.evict(EvictParams(num_tokens=10))
+            self.assertEqual(host_hit(stage.cache, full_branch), 10)
+            stage.host.transfer.reads.clear()
+
+        landing = pair.decode.extension.landing
+        for index in range(STAGES):
+            landing._pools.transfer(index).registrations.clear()
+
+        tokens = full_branch + [1, 2, 3]
+        reqs = pair.request(9, tokens)
+        pair.decode.queue.queue.append(SimpleNamespace(req=reqs[0]))
+        pair.decode.extension.source.offer_stage_prefix(
+            room=9, tokens=tokens[:-1], scope=(None, None)
+        )
+        pair.decode_asks_for(9)
+        pair.ring_step(2 * LAG + 4, ready={"rid-9"})
+
+        # Each stage already held 10 pages in host DRAM, so it must ask decode only for pages [10, 16) (6 pages).
+        for index, stage in enumerate(pair.stages):
+            (read,) = stage.host.transfer.reads.values()
+            self.assertEqual(read["remote_block_ids"], list(range(10, 16)))
+            registered = landing._pools.transfer(index).registrations
+            self.assertEqual([r[1] for r in registered.values()], [list(range(10, 16))])
+
+        pair.stage_transfers("received")
+        pair.decode_transfers("sent")
+        pair.ring_step(2 * LAG + 4, ready={"rid-9"})
+        for stage in pair.stages:
+            self.assertEqual(host_hit(stage.cache, full_branch), 16)
+            self.assertEqual(stage.extension.recall.stats["reused_local_pages"], 10)
+
+    def test_stage_pages_per_window_page_env_and_muse_spark_agentic_overrides(self):
+        page, window = HYBRID_PAGE, 2 * HYBRID_PAGE
+        with (
+            tpu_envs.SGLANG_PD_OFFLOAD_STAGE_STORE_GB.override(1.0),
+            tpu_envs.SGLANG_PD_OFFLOAD_STAGE_PAGES_PER_WINDOW_PAGE.override(32),
+        ):
+            pair = _Pair(
+                self,
+                make_cache=lambda: hybrid_cache(window=window),
+                page_size=page,
+            )
+            session = list(range(4 * page))
+            for stage in pair.stages:
+                radix_host_ops.insert_host_prefix(
+                    stage.cache,
+                    RadixKey(array("q", session)),
+                    stage.host.alloc(len(session)),
+                    page,
+                    swa_indices=stage.swa_host.alloc(window),
+                )
+                stage.scheduler.waiting_queue.append("serving")
+            pair.request(1, session + [999])
+            pair.decode_asks_for(1)
+            pair.ring_step(2 * LAG + 4, ready={"rid-1"})
+            pair.decode_step()
+            self.assertEqual(
+                pair.decode.extension.landing._pools._pages_per_window_page, 32
+            )
+
+        from benchmark.tpu.recipe.configs.muse_spark import agentic
+
+        cfg_p = agentic.get_config(64, mode="prefill")
+        cfg_d = agentic.get_config(64, mode="decode")
+        self.assertEqual(cfg_p["runtime_env"]["SGLANG_TPU_PRELOAD_TCMALLOC"], "1")
+        with patch.dict(
+            "os.environ",
+            {
+                "MUSE_PREFILL_WRITE_POLICY": "write_back",
+                "MUSE_DECODE_HICACHE_GB": "32",
+                "MUSE_PD_RUNNING_REQUESTS": "64",
+            },
+        ):
+            agentic._apply_local_overrides(cfg_p, "prefill")
+            agentic._apply_local_overrides(cfg_d, "decode")
+        self.assertEqual(cfg_p["server_args"]["hicache_write_policy"], "write_back")
+        self.assertEqual(cfg_d["server_args"]["hicache_size"], 32)
+        self.assertEqual(cfg_d["server_args"]["max_running_requests"], 64)
+        self.assertEqual(len(cfg_d["server_args"]["tpu_compile_bs"]), 22)
+        self.assertEqual(cfg_d["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "512")
+
+        with (
+            patch.dict("os.environ", {"MUSE_PD_ADAPTIVE_VERIFY": "3:4:3.06"}),
+            self.assertRaises(ValueError),
+        ):
+            agentic._apply_local_overrides(cfg_d, "decode")
+
+        with patch.dict(
+            "os.environ",
+            {
+                "MUSE_PD_ADAPTIVE_VERIFY": "3:4:3.06",
+                "SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER": "0",
+            },
+        ):
+            agentic._apply_local_overrides(cfg_d, "decode")
+        self.assertEqual(
+            cfg_d["runtime_env"]["SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY"], "3:4:3.06"
+        )
+        self.assertEqual(cfg_d["runtime_env"]["SGLANG_TPU_MUSE_MK_MAX_ROWS"], "256")
+
+    def test_hybrid_ancestor_leaf_pushable_after_pushed_child_evicted(self):
+        page, window = HYBRID_PAGE, 2 * HYBRID_PAGE
+        pair = _Pair(self, lambda: hybrid_cache(window=window), page_size=page)
+        turn1 = list(range(4 * page))
+        turn2 = turn1 + list(range(4 * page, 6 * page))
+
+        # Turn 1 completes with its own window at 4*page.
+        for stage in pair.stages:
+            radix_host_ops.insert_host_prefix(
+                stage.cache,
+                RadixKey(array("q", turn1)),
+                stage.host.alloc(len(turn1)),
+                page,
+                swa_indices=stage.swa_host.alloc(window),
+            )
+        pair.request(1, turn1 + [991])
+        pair.decode_asks_for(1)
+        pair.ring_step(2 * LAG + 4, ready={"rid-1"})
+
+        # Turn 2 extends Turn 1 to 6*page with its own window at 6*page, and gets pushed first
+        # if Turn 1 was touched more recently.
+        import torch
+
+        for stage in pair.stages:
+            _, have, tensors = radix_host_ops.host_backed_prefix(
+                stage.cache, RadixKey(array("q", turn1)), len(turn1), page
+            )
+            self.assertEqual(have, len(turn1))
+            reused = torch.cat(tensors) if len(tensors) > 1 else tensors[0]
+            radix_host_ops.insert_host_prefix(
+                stage.cache,
+                RadixKey(array("q", turn2)),
+                torch.cat([reused, stage.host.alloc(2 * page)]),
+                page,
+                swa_indices=stage.swa_host.alloc(window),
+                reused_tokens=len(turn1),
+            )
+            stage.scheduler.waiting_queue.append("serving")
+        pair.request(2, turn2 + [992])
+        pair.decode_asks_for(2)
+        pair.ring_step(2 * LAG + 4, ready={"rid-2"})
+        pair.decode_step()
+        pair.decode_transfers("received")
+        pair.stage_transfers("sent")
+        pair.decode_step()
+        pair.ring_step(LAG + 2)
+
+        store = pair.decode.extension.landing.store
+        self.assertTrue(store.holds((None, None), turn2, with_window=True))
+        # Decode holds NO window at turn1 (4*page), so match(turn1) is None!
+        self.assertIsNone(store.match((None, None), turn1))
+
+        # Evict the 2-page Turn-2 suffix from prefill host RAM so Turn 1 becomes a leaf again.
+        for stage in pair.stages:
+            stage.cache.evict_host(2 * page, FULL)
+            self.assertEqual(host_hit(stage.cache, turn2), len(turn1))
+
+        # Turn 1 must still be pushable (not poisoned by Turn 2's push) so decode acquires a window at 4*page!
+        pair.ring_step(LAG + 2)
+        pair.decode_step()
+        pair.decode_transfers("received")
+        pair.stage_transfers("sent")
+        pair.decode_step()
+        pair.ring_step(LAG + 2)
+        match = store.match((None, None), turn1)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.num_pages, 4)
+
+    def test_write_through_recall_reclaims_full_host_duplicates_when_short(self):
+        def wt_cache():
+            cache, allocator = full_cache(kv_size=64, host_capacity=32)
+            cache.tree_core.is_write_back = cache.is_write_back = False
+            return cache, allocator
+
+        pair = _Pair(self, make_cache=wt_cache)
+        branch = list(range(700, 712))
+        filler = list(range(800, 828))
+
+        with tpu_envs.SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS.override(24):
+            for stage in pair.stages:
+                radix_host_ops.insert_host_prefix(
+                    stage.cache,
+                    RadixKey(array("q", branch)),
+                    stage.host.alloc(len(branch)),
+                    1,
+                )
+                stage.scheduler.waiting_queue.append("serving")
+            pair.request(1, branch + [999])
+            pair.decode_asks_for(1)
+            pair.ring_step(LAG + 2, ready={"rid-1"})
+            pair.ring_step(LAG + 2)
+            pair.decode_step()
+            pair.decode_transfers("received")
+            pair.stage_transfers("sent")
+            pair.decode_step()
+            pair.ring_step(LAG + 2)
+
+        # Evict branch from prefill host, then insert 28 device+host duplicate filler tokens
+        # leaving only 4 free host tokens (< 12 needed to recall branch) that evict_host cannot free.
+        for stage in pair.stages:
+            stage.scheduler.waiting_queue.clear()
+            stage.cache.evict_host(12, FULL)
+            self.assertEqual(host_hit(stage.cache, branch), 0)
+            insert_tokens(stage.cache, stage.allocator, filler)
+            node = root_node(stage.cache, 800)
+            stage.cache.tree_core.commit_backup(
+                node.id, stage.host.alloc(len(node.key)), {}
+            )
+            stage.cache.tree_core._update_duplicate_tracking(node)
+            self.assertEqual(stage.host.available_size(), 4)
+
+        reqs = pair.request(5, branch + [1])
+        pair.decode.queue.queue.append(SimpleNamespace(req=reqs[0]))
+        pair.decode.extension.source.offer_stage_prefix(
+            room=5, tokens=branch, scope=(None, None)
+        )
+        pair.decode_asks_for(5)
+        pair.ring_step(2 * LAG + 4, ready={"rid-5"})
+        pair.stage_transfers("received")
+        pair.decode_transfers("sent")
+        pair.ring_step(2 * LAG + 4, ready={"rid-5"})
+        for stage in pair.stages:
+            self.assertEqual(stage.extension.recall.stats["no_memory"], 0)
+            self.assertEqual(host_hit(stage.cache, branch), 12)
 
 
 if __name__ == "__main__":

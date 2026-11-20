@@ -52,6 +52,11 @@ def _path_to_root(cache: Any, node: Any) -> Iterator[Any]:
         node = node.parent
 
 
+def path_len(cache: Any, leaf: Any) -> int:
+    """The number of tokens on the path from the root to ``leaf``."""
+    return sum(len(node.key) for node in _path_to_root(cache, leaf))
+
+
 def path_tokens(cache: Any, leaf: Any) -> List[int]:
     """The token ids on the path from the root to ``leaf``."""
     path = list(_path_to_root(cache, leaf))

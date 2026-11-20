@@ -180,6 +180,8 @@ _PATCHES_BY_CONCURRENCY: dict[int, dict[str, dict]] = {
     24: _patch(6, mk_max_rows=48),
     28: _patch(6, mk_max_rows=48),
     32: _patch(6, prefill_decode_interval=16, mk_max_rows=48),
+    48: _patch(6, prefill_decode_interval=16, mk_max_rows=48),
+    64: _patch(6, prefill_decode_interval=16, mk_max_rows=48),
 }
 
 
@@ -200,6 +202,8 @@ _PD: dict[str, dict] = {
     },
     "runtime_env": {
         "SGLANG_WARMUP_TIMEOUT": "3600",
+        # Preload tcmalloc to prevent glibc arena bloat (+70.7 GiB prefill / +111 GiB decode).
+        "SGLANG_TPU_PRELOAD_TCMALLOC": "1",
         # These JobSet variables describe the public router, not its engines.
         "HOST": None,
         "PORT": None,
@@ -274,6 +278,57 @@ def _write_swa_draft(model_root: Path) -> Path:
     return target
 
 
+_WRITE_POLICIES = ("write_through", "write_through_selective", "write_back")
+
+
+def _compile_bs_buckets(running: int, verify: int = DRAFT_TOKENS) -> list[int]:
+    """8-row megakernel tile-aligned decode batch buckets up to ``running``."""
+    buckets = [1] + [
+        b for b in range(2, running) if b * verify % 8 == 0 and (b <= 8 or b % 4 == 0)
+    ]
+    return buckets + [running] if running > 1 else buckets
+
+
+def _apply_local_overrides(config: dict, mode: str) -> None:
+    """Apply optional Muse Spark P/D benchmark environment overrides."""
+    import os
+
+    args, env = config["server_args"], config["runtime_env"]
+    if mode == "decode" and os.environ.get("MUSE_DECODE_HICACHE_GB"):
+        args["hicache_size"] = int(os.environ["MUSE_DECODE_HICACHE_GB"])
+    policy = os.environ.get("MUSE_PREFILL_WRITE_POLICY")
+    if mode == "prefill" and policy:
+        if policy not in _WRITE_POLICIES:
+            raise ValueError(
+                f"MUSE_PREFILL_WRITE_POLICY={policy!r} is not one of {_WRITE_POLICIES}"
+            )
+        args["hicache_write_policy"] = policy
+    if mode == "decode" and os.environ.get("MUSE_PD_RUNNING_REQUESTS"):
+        running = int(os.environ["MUSE_PD_RUNNING_REQUESTS"])
+        mk_rows = running * DRAFT_TOKENS
+        args.update(
+            max_running_requests=running,
+            torch_compile_max_bs=running,
+            tpu_compile_bs=_compile_bs_buckets(running, DRAFT_TOKENS),
+        )
+        env["SGLANG_TPU_MUSE_MK_MAX_ROWS"] = str(max(48, -(-mk_rows // 8) * 8))
+    if mode == "decode" and os.environ.get("MUSE_PD_ADAPTIVE_VERIFY"):
+        if os.environ.get("SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER") == "0":
+            env["SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER"] = "0"
+        if env.get("SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER", "1") != "0":
+            raise ValueError(
+                "MUSE_PD_ADAPTIVE_VERIFY requires DFlashWorkerV2 "
+                "(set SGLANG_TPU_ENABLE_EXPERIMENTAL_SPEC_WORKER=0); "
+                "TpuBlockSpecWorker uses fixed verify width."
+            )
+        spec = os.environ["MUSE_PD_ADAPTIVE_VERIFY"]
+        env["SGLANG_TPU_DFLASH_ADAPTIVE_VERIFY"] = spec
+        min_bs, width = (int(x) for x in spec.split(":")[:2])
+        running = int(args["max_running_requests"])
+        rows = max((min_bs - 1) * DRAFT_TOKENS, running * width)
+        env["SGLANG_TPU_MUSE_MK_MAX_ROWS"] = str(max(48, -(-rows // 8) * 8))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Serve one Muse Spark AgentX engine.")
     parser.add_argument("mode", choices=MODES)
@@ -288,6 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.mode == "mixed":
         config["server_args"].update(host="0.0.0.0", port=PORT)
+    _apply_local_overrides(config, args.mode)
     print(json.dumps(config, indent=1))
     if args.dry_run:
         return 0

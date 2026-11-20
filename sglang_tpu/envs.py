@@ -340,6 +340,13 @@ class TpuEnvs:
     # decode rank for the pools that keep pushed branches in the prefill
     # stages' layouts. 0 takes the size of the rank's own HiCache host pool.
     SGLANG_PD_OFFLOAD_STAGE_STORE_GB = EnvFloat(0.0)
+    # Full pages bought per page of sliding window in the decode stage store
+    # (default 0 uses DEFAULT_PAGES_PER_WINDOW_PAGE=4; e.g. 64 matches 128K+
+    # multi-turn AgentX prompts instead of spending >50% of budget on windows).
+    SGLANG_PD_OFFLOAD_STAGE_PAGES_PER_WINDOW_PAGE = EnvInt(0)
+    # Free tokens of a pipeline stage's full-attention host pool below which
+    # victim pushes begin (0 uses the default pool-lead watermark).
+    SGLANG_PD_OFFLOAD_PUSH_FREE_TOKENS = EnvInt(0)
     # Debugging: a pipeline prefill hashes the bytes of every host page it
     # pushes to decode DRAM and of every page it recalls, and counts the
     # recalled pages whose bytes it never pushed.

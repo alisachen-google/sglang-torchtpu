@@ -239,6 +239,9 @@ def _stage_decode_extension(
 ) -> DecodeDramOffloadExtension:
     """The decode of a pipeline-parallel prefill: pushed branches go to pools
     in the prefill stages' layouts, outside this decode's radix cache."""
+    from sglang_tpu.disaggregation.decode_dram_offload.stage_layout_store import (
+        DEFAULT_PAGES_PER_WINDOW_PAGE,
+    )
     from sglang_tpu.disaggregation.decode_dram_offload.stage_pool_builder import (
         build_stage_pool,
         stage_pool_layout,
@@ -255,6 +258,10 @@ def _stage_decode_extension(
         decode_ranks=manager.attn_tp_size,
         budget_bytes=budget,
         build_pool=functools.partial(build_stage_pool, device=device),
+        pages_per_window_page=(
+            tpu_envs.SGLANG_PD_OFFLOAD_STAGE_PAGES_PER_WINDOW_PAGE.get()
+            or DEFAULT_PAGES_PER_WINDOW_PAGE
+        ),
     )
     channel.bind_stage_pools(pools)
     last_log = [0.0]
